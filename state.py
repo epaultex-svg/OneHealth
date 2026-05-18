@@ -23,9 +23,9 @@ class OneHealthAgentState(TypedDict):
     
     confirmation: bool # user confirmation to proceed
 
-    search_results: list[str] # LLM results
+    appt_website: str # firecrawl results
 
-    appt_details: dict # Nexhealth API results
+    appt_details: dict
 
 
     
