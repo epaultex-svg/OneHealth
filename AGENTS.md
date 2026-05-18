@@ -19,7 +19,7 @@ Defined in `@tools.py`:
 
 | Tool | Purpose |
 |------|---------|
-| `read_message()` | Reads inbound user messages from Telegram |
+| `read_message()` | Reads latest inbound user messages from Telegram |
 | `send_message()` | Sends outbound messages to user via Telegram |
 | `firecrawl_search()` | Searches relevant websites using Firecrawl MCP for healthcare appointments |
 | 'check_cookies()'     | Checks to see if there's a Browserbase session ID before scheduling |
