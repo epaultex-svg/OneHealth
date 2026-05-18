@@ -11,9 +11,6 @@ class OneHealthAgentState(TypedDict):
     username: str
     message_history: list[str]
     user_message_classification: TextClassification | None
-    
-    # outbound message information
-    outbound_message_content: str
 
     # appointment information
     appointment_date: str
