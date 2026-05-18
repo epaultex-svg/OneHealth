@@ -4,7 +4,7 @@
 
 OneHealth is a LangGraph agent that automatically schedules healthcare appointments for users. The agent handles two primary workflows:
 
-1. **Appointment Booking**: User requests appointment → search relevant websites → book via Nexhealth API → confirm via Telegram
+1. **Appointment Booking**: User requests appointment → search relevant websites → check for cookies via Browserbase Contexts (if not, hand-off to user) -> book via Stagehand SDK → confirm via Telegram
 2. **Preference Storage**: User provides preferences → store in Supabase → confirm via Telegram
 
 ## Communication
@@ -21,9 +21,9 @@ Defined in `@tools.py`:
 |------|---------|
 | `read_message()` | Reads inbound user messages from Telegram |
 | `send_message()` | Sends outbound messages to user via Telegram |
-| `classify_intent()` | Classifies message as appointment request or user info storage |
 | `firecrawl_search()` | Searches relevant websites using Firecrawl MCP for healthcare appointments |
-| `book_appointment()` | Creates appointment via Nexhealth API |
+| 'check_cookies()'     | Checks to see if there's a Browserbase session ID before scheduling |
+| `book_appointment()` | Creates appointment via Stagehand SDK |
 | `store_info()` | Stores user preferences in Supabase |
 
 ## State
@@ -42,14 +42,14 @@ Defined in `@state.py`:
 
 ## Nodes
 
-Full workflow graph: https://excalidraw.com/#json=RrsaUzvKhWaUdaKFQsmGl,_86c8253lKlnMfL7XYP6XA
+Full workflow graph: https://excalidraw.com/#json=YYAkP17-RrX6YB5yncZN-,KPS3-Q_FjHjnGOClENvOcg
 
 Each box in the diagram (excluding "State" and "Notes/Architecture decisions") represents a node in the LangGraph agent.
 
 ## External APIs & Services
 
 - **Firecrawl MCP**: Web scraping and search
-- **Nexhealth API**: Healthcare appointment booking
+- **BrowserBase API**: Healthcare appointment booking (Stagehand) and Cookie checking (Browserbase contexts)
 - **Supabase**: User preference persistence
 - **Telegram Bot API**: User messaging
 
