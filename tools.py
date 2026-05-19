@@ -37,8 +37,9 @@ def read_message() -> dict:
     Calls getUpdates with offset=-1 to fetch the most recent update.
     Caller must acknowledge by issuing getUpdates with offset=update_id+1.
 
-    Returns dict with: chat_id (str), message_content (str),
-    username (str), update_id (int). Returns {} if no messages.
+    Returns dict with: chat_id (str), user_message_content (str),
+    username (str), update_id (int), location (dict | None). Returns {}
+    if no messages.
     """
     load_dotenv()
     token = os.getenv("TELEGRAM_API_TOKEN")
@@ -66,6 +67,7 @@ def read_message() -> dict:
         "user_message_content": message.get("text", ""),
         "username": message.get("from", {}).get("username", ""),
         "update_id": update.get("update_id"),
+        "location": message.get("location"),
     }
 
 
@@ -256,11 +258,14 @@ def store_info(
     website: str | None = None,
     context_id: str | None = None,
     appt_details: dict | None = None,
+    insurance: dict | None = None,
 ) -> dict:
     """Upsert user data into the Supabase `users` table.
 
-    Pass only the fields you have. `location` is overwrite-on-update
-    (expects raw Telegram payload `{"latitude": float, "longitude": float}`).
+    Pass only the fields you have. `location` and `insurance` are
+    overwrite-on-update (`location` expects raw Telegram payload
+    `{"latitude": float, "longitude": float}`; `insurance` is a free-form
+    dict, e.g. `{"provider": str, "member_id": str, "group_id": str}`).
     Arrays (browserbase_context_ids, appointments) are append-only;
     existing entries are preserved.
     """
@@ -293,6 +298,9 @@ def store_info(
             {"website": website, "context_id": context_id}
         ]
         fields_written.append("browserbase_context_ids")
+    if insurance is not None:
+        row["insurance"] = insurance
+        fields_written.append("insurance")
     if website and appt_details:
         row["appointments"] = (row.get("appointments") or []) + [
             {

@@ -8,6 +8,7 @@ class OneHealthAgentState(TypedDict):
     # inbound message information
     chat_id: str
     user_message_content: str
+    user_location: dict | None
     username: str
     message_history: list[str]
     user_message_classification: TextClassification | None
