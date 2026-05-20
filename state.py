@@ -1,7 +1,22 @@
 from typing import TypedDict, Literal
 
-class TextClassification (TypedDict):
+class TextClassification(TypedDict):
     intent: Literal["user_info", "appointment"]
+
+class ConfirmationDecision(TypedDict):
+    decision: Literal["confirmed", "denied"]
+
+class AppointmentDetails(TypedDict):
+        Date: str
+        Specialty: str
+        Practice: str
+        Reason: str
+        Insurance: str
+        Location: str
+
+class UserInfoExtracted(TypedDict, total=False):
+    username: str
+    insurance: dict
 
 class OneHealthAgentState(TypedDict):
 
@@ -14,16 +29,16 @@ class OneHealthAgentState(TypedDict):
     user_message_classification: TextClassification | None
 
     # appointment information
-    appointment_date: str
-    appointment_time: str
-    appointment_provider: str
-    appointment_type: str
-    
-    confirmation: bool # user confirmation to proceed
+    appt_details: AppointmentDetails
+    appt_draft: str
+
+    # user info storage
+    user_info_draft: str
+    user_info_extracted: UserInfoExtracted | None
 
     appt_website: str # firecrawl results
 
-    appt_details: dict
+    
 
 
     
