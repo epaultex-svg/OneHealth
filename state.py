@@ -38,6 +38,7 @@ class OneHealthAgentState(TypedDict):
     # appointment information
     appt_details: AppointmentDetails
     appt_draft: str
+    book_appointment_result: dict | None
 
     # user info storage
     user_info_draft: str
