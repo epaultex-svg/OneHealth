@@ -43,8 +43,9 @@ def _telegram_send(chat_id: str, text: str) -> None:
 def read_message() -> dict:
     """Read the latest inbound message from the Telegram bot inbox.
 
-    Calls getUpdates with offset=-1 to fetch the most recent update.
-    Caller must acknowledge by issuing getUpdates with offset=update_id+1.
+    Fetches the oldest unacknowledged update via getUpdates, then immediately
+    acknowledges it by calling getUpdates with offset=update_id+1 so the same
+    update is never re-delivered on the next call.
 
     Returns dict with: chat_id (str), user_message_content (str),
     username (str), update_id (int), location (dict | None). Returns {}
@@ -52,30 +53,34 @@ def read_message() -> dict:
     """
     load_dotenv()
     token = os.getenv("TELEGRAM_API_TOKEN")
-
     url = f"https://api.telegram.org/bot{token}/getUpdates"
-    params = {
-        "offset": -1,
-        "limit": 1,
-        "allowed_updates": ["message"],
-    }
 
-    response = httpx.get(url, params=params)
+    response = httpx.get(
+        url,
+        params={"limit": 1, "allowed_updates": ["message"]},
+        timeout=10.0,
+    )
     response.raise_for_status()
-    data = response.json()
-
-    results = data.get("result", [])
+    results = response.json().get("result", [])
     if not results:
         return {}
 
     update = results[0]
+    update_id = update.get("update_id")
     message = update.get("message", {})
+
+    # Acknowledge: offset=update_id+1 marks this update as confirmed.
+    httpx.get(
+        url,
+        params={"offset": update_id + 1, "limit": 0, "allowed_updates": ["message"]},
+        timeout=10.0,
+    )
 
     return {
         "chat_id": str(message.get("chat", {}).get("id", "")),
         "user_message_content": message.get("text", ""),
         "username": message.get("from", {}).get("username", ""),
-        "update_id": update.get("update_id"),
+        "update_id": update_id,
         "location": message.get("location"),
     }
 
