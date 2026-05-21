@@ -20,11 +20,15 @@ Defined in `@tools.py`:
 | Tool | Purpose |
 |------|---------|
 | `read_message()` | Reads latest inbound user messages from Telegram |
-| `send_message()` | Sends outbound messages to user via Telegram |
+| `send_message()` | Sends outbound messages to user via Telegram (optional Mini App keyboard) |
 | `firecrawl_search()` | Searches relevant websites using Firecrawl MCP for healthcare appointments |
-| 'check_cookies()'     | Checks to see if there's a Browserbase session ID before scheduling |
-| `book_appointment()` | Creates appointment via Stagehand SDK |
+| `check_cookies_tool()` | Looks up saved Browserbase **context_id** for a website in Supabase |
+| `book_appointment()` | Books via Stagehand using persisted Browserbase context (cookies) |
 | `store_info()` | Stores user preferences in Supabase |
+
+Login flow helpers in `tools.py` (not `@tool`): `start_browserbase_login`, `finish_browserbase_login`.
+
+Login nodes: `start_user_login` → `await_user_login` (interrupt) → `schedule_appointment` → `book_appointment`.
 
 ## State
 
@@ -37,12 +41,14 @@ Defined in `@state.py`:
 | `username` | str | User identifier | No |
 | `message_classification` | TextClassification | Intent classification (appointment/user_info) | Yes — cannot recalculate |
 | `confirmation` | bool | User approval to proceed | No |
-| `search_results` | list[str] | Firecrawl website search results | No |
-| `appt_details` | dict | Nexhealth API appointment response | No |
+| `appt_website` | str | Selected healthcare booking website URL from Firecrawl search | No |
+| `browserbase_context_id` | str \| None | Persisted Browserbase context (auth cookies) | Yes for booking |
+| `browserbase_session_id` | str \| None | Active login session (live view only) | No |
+| `appt_details` | dict | Appointment fields for booking | No |
 
 ## Nodes
 
-Full workflow graph: https://excalidraw.com/#json=YYAkP17-RrX6YB5yncZN-,KPS3-Q_FjHjnGOClENvOcg
+Full workflow graph: https://excalidraw.com/#json=hZ8WnN3h215wmn9HTe4k6,XuY3QWH6hPYToWLgZyoNlg
 
 Each box in the diagram (excluding "State" and "Notes/Architecture decisions") represents a node in the LangGraph agent.
 
@@ -56,5 +62,5 @@ Each box in the diagram (excluding "State" and "Notes/Architecture decisions") r
 ## Key Design Decisions
 
 - Classification result is immutable downstream (cannot be recalculated)
-- State includes both transient fields (confirmation, search_results) and persistent fields (chat_id, username)
+- State includes both transient fields (confirmation, appt_website) and persistent fields (chat_id, username)
 - Separate workflows for appointment vs. preference storage based on intent classification

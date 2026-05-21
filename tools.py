@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -17,6 +18,14 @@ def _normalize_host(website: str) -> str:
     parsed = urlparse(website if "://" in website else f"//{website}", scheme="")
     host = (parsed.hostname or website).lower().strip()
     return host[4:] if host.startswith("www.") else host
+
+def _browserbase_headers() -> dict[str, str]:
+    load_dotenv()
+    return {
+        "Content-Type": "application/json",
+        "X-BB-API-Key": os.getenv("BROWSERBASE_API_KEY", ""),
+    }
+
 
 def _telegram_send(chat_id: str, text: str) -> None:
     """Push a status line to the user via Telegram. Best-effort, swallows errors."""
@@ -72,20 +81,30 @@ def read_message() -> dict:
 
 
 @tool
-def send_message(chat_id: str, text: str) -> dict:
-    """Send an outbound message to a user via the Telegram bot."""
+def send_message(chat_id: str, text: str, web_app_url: str | None = None) -> dict:
+    """Send an outbound message to a user via the Telegram bot.
+
+    When `web_app_url` is set, attaches a reply keyboard with an Open login
+    Mini App button and a Done button.
+    """
 
     load_dotenv()
     token = os.getenv("TELEGRAM_API_TOKEN")
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    params = {
-        "chat_id": chat_id,
-        "text": text,
-    }
+    payload: dict = {"chat_id": chat_id, "text": text}
+    if web_app_url:
+        payload["reply_markup"] = {
+            "keyboard": [
+                [{"text": "Open login", "web_app": {"url": web_app_url}}],
+                [{"text": "Done"}],
+            ],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
 
-    response = httpx.post(url, params=params)
+    response = httpx.post(url, json=payload, timeout=10.0)
     response.raise_for_status()
     data = response.json()
 
@@ -98,6 +117,70 @@ def send_message(chat_id: str, text: str) -> dict:
         "outbound_message_content": results.get("text", ""),
         "message_thread_id": results.get("message_thread_id"),
     }
+
+
+async def start_browserbase_login(website: str) -> dict:
+    """Create a persisted Browserbase context/session and open the login page.
+
+    Returns session_id, context_id, and live_view_url for Telegram Mini App.
+    """
+    load_dotenv()
+    headers = _browserbase_headers()
+    base = "https://api.browserbase.com/v1"
+
+    ctx_resp = httpx.post(f"{base}/contexts", headers=headers, json={}, timeout=30.0)
+    ctx_resp.raise_for_status()
+    context_id = ctx_resp.json()["id"]
+
+    session_body: dict = {
+        "keepAlive": True,
+        "browserSettings": {
+            "context": {"id": context_id, "persist": True},
+        },
+    }
+    project_id = os.getenv("BROWSERBASE_PROJECT_ID")
+    if project_id:
+        session_body["projectId"] = project_id
+
+    sess_resp = httpx.post(
+        f"{base}/sessions", headers=headers, json=session_body, timeout=30.0
+    )
+    sess_resp.raise_for_status()
+    session_id = sess_resp.json()["id"]
+
+    async with AsyncStagehand(
+        browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
+        model_api_key=os.getenv("OPENROUTER_API_KEY"),
+    ) as client:
+        await client.sessions.navigate(id=session_id, url=website)
+
+    debug_resp = httpx.get(
+        f"{base}/sessions/{session_id}/debug", headers=headers, timeout=30.0
+    )
+    debug_resp.raise_for_status()
+    debug = debug_resp.json()
+    live_view_url = debug.get("debuggerFullscreenUrl") or ""
+    if not live_view_url:
+        pages = debug.get("pages") or []
+        if pages:
+            live_view_url = pages[0].get("debuggerFullscreenUrl") or ""
+
+    return {
+        "session_id": session_id,
+        "context_id": context_id,
+        "live_view_url": live_view_url,
+    }
+
+
+async def finish_browserbase_login(session_id: str) -> None:
+    """End the login session so persisted cookies flush to the context."""
+    load_dotenv()
+    async with AsyncStagehand(
+        browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
+        model_api_key=os.getenv("OPENROUTER_API_KEY"),
+    ) as client:
+        await client.sessions.end(id=session_id)
+    await asyncio.sleep(2)
 
 @tool
 def firecrawl_search(query: str) -> dict:
@@ -115,7 +198,7 @@ def firecrawl_search(query: str) -> dict:
 
 
 @tool
-def check_cookies(chat_id: str, website: str) -> dict:
+def check_cookies_tool(chat_id: str, website: str) -> dict:
     """Look up a Browserbase context for `website` saved under this user.
 
     Scans the `browserbase_context_ids` array on the user's Supabase row and
@@ -238,7 +321,7 @@ async def book_appointment(
 
             _telegram_send(
                 chat_id,
-                f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ""}",
+                f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ''}",
             )
 
             return {

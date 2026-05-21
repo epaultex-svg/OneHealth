@@ -15,17 +15,22 @@ from langgraph.types import Command, interrupt
 from supabase import create_client
 
 from state import (
+    AppointmentDetails,
     ConfirmationDecision,
+    FirecrawlSearchQuery,
     OneHealthAgentState,
     TextClassification,
     UserInfoExtracted,
+    WebsiteSelection,
 )
 from tools import (
     book_appointment,
-    check_cookies,
+    check_cookies_tool,
+    finish_browserbase_login,
     firecrawl_search,
     read_message,
     send_message,
+    start_browserbase_login,
     store_info,
 )
 
@@ -147,7 +152,7 @@ def classify_intent(
 
 def draft_appointment_details(
     state: OneHealthAgentState,
-) -> Command[Literal["user_confirmation"]]:
+) -> Command[Literal["send_user_confirmation"]]:
     """Draft a confirmation message string for the user.
 
     Reads user_message_content from state and saved location/insurance from
@@ -195,14 +200,28 @@ def draft_appointment_details(
         HumanMessage(content=user_message_content),
     ]).content
 
+    extract_system = (
+        "Extract structured appointment details from the user's message. "
+        "Use saved location/insurance when the user did not specify a value. "
+        "Use 'not specified' if neither is available.\n\n"
+        f"Saved user location: {saved_location}\n"
+        f"Saved user insurance: {saved_insurance}\n\n"
+        "Return all fields: Date, Specialty, Practice, Reason, Insurance, Location."
+    )
+    extractor = _model().with_structured_output(AppointmentDetails)
+    details: AppointmentDetails = extractor.invoke([
+        SystemMessage(content=extract_system),
+        HumanMessage(content=user_message_content),
+    ])
+
     return Command(
-        update={"appt_draft": draft},
-        goto="user_confirmation",
+        update={"appt_draft": draft, "appt_details": details},
+        goto="send_user_confirmation",
     )
 
 def draft_user_info_storage_details(
     state: OneHealthAgentState,
-) -> Command[Literal["user_confirmation"]]:
+) -> Command[Literal["send_user_confirmation"]]:
     """Draft a confirmation message for user-info storage.
 
     Reads user_message_content, asks the LLM to extract only the supported
@@ -255,15 +274,30 @@ def draft_user_info_storage_details(
         goto="send_user_confirmation",
     )
 
-def send_user_confirmation():
-    pass
+def send_user_confirmation(
+    state: OneHealthAgentState,
+) -> Command[Literal["interpret_user_confirmation"]]:
+    """Send the draft confirmation message to the user, then route to interpretation.
+
+    Picks appt_draft or user_info_draft based on the upstream intent
+    classification. Sends via Telegram. The downstream node handles the
+    interrupt + reply parsing.
+    """
+    chat_id = state["chat_id"]
+    intent = state["user_message_classification"]["intent"]
+
+    draft = state["appt_draft"] if intent == "appointment" else state["user_info_draft"]
+
+    send_message.invoke({"chat_id": chat_id, "text": draft})
+
+    return Command(goto="interpret_user_confirmation")
 
 def interpret_user_confirmation(
     state: OneHealthAgentState,
-) -> Command[Literal["store_in_supabase", "appointment_website_search", "correct_info"]]:
+) -> Command[Literal["store_in_supabase", "appointment_website_search", "send_correction_query"]]:
     """Wait for user reply, interpret as confirm/deny, route accordingly.
 
-    Does NOT send anything. Pauses on interrupt(), reads the latest Telegram
+    Pauses on interrupt(), reads the latest Telegram
     message via read_message.invoke({}), classifies the reply with a
     structured-output LLM call, and routes based on the decision plus the
     upstream user_message_classification.
@@ -290,7 +324,7 @@ def interpret_user_confirmation(
     ])
 
     if decision["decision"] == "denied":
-        next_node = "correct_info"
+        next_node = "send_correction_query"
     elif intent == "appointment":
         next_node = "appointment_website_search"
     else:
@@ -304,8 +338,99 @@ def interpret_user_confirmation(
         goto=next_node,
     )
 
-def correct_info():
-    pass
+def send_correction_query(
+    state: OneHealthAgentState,
+) -> Command[Literal["correct_info"]]:
+    """Ask user what to fix after they reject confirmation draft."""
+    chat_id = state["chat_id"]
+    send_message.invoke({"chat_id": chat_id, "text": "What did I miss?"})
+    return Command(goto="correct_info")
+
+def correct_info(
+    state: OneHealthAgentState,
+) -> Command[Literal["send_user_confirmation"]]:
+    """Wait for user correction, revise draft, route back to confirmation."""
+    chat_id = state["chat_id"]
+    intent = state["user_message_classification"]["intent"]
+
+    interrupt({"chat_id": chat_id, "prompt": "awaiting_correction"})
+
+    msg = read_message.invoke({})
+    correction_text = msg["user_message_content"]
+
+    if intent == "appointment":
+        current_draft = state["appt_draft"]
+        system = (
+            "You are an appointment intake assistant. Apply the user's "
+            "corrections to the confirmation draft below.\n\n"
+            f"Current draft:\n{current_draft}\n\n"
+            "Respond with ONLY the updated confirmation text, keeping exactly "
+            "this format:\n"
+            "Okay, updated...\n"
+            "- Date: <date>\n"
+            "- Specialty: <specialty>\n"
+            "- Practice: <practice>\n"
+            "- Reason: <reason>\n"
+            "- Insurance: <insurance>\n"
+            "- Location: <location>\n"
+            "Does this look right?"
+        )
+    else:
+        current_draft = state["user_info_draft"]
+        system = (
+            "You are a profile-storage assistant. Apply the user's "
+            "corrections to the confirmation draft below.\n\n"
+            f"Current draft:\n{current_draft}\n\n"
+            "Respond with ONLY the updated confirmation text, keeping exactly "
+            "this format:\n"
+            "Okay, updated. Does this look right?\n"
+            "- <item>: <value>\n"
+            "(repeat the bullet line for each mentioned field)"
+        )
+
+    revised: str = _model().invoke([
+        SystemMessage(content=system),
+        HumanMessage(content=correction_text),
+    ]).content
+
+    update: dict = {"user_message_content": correction_text}
+    if intent == "appointment":
+        update["appt_draft"] = revised
+        current_details = state.get("appt_details") or {}
+        extract_system = (
+            "Apply the user's correction to the appointment details. "
+            f"Current details: {current_details}\n\n"
+            "Return merged details for all fields: Date, Specialty, Practice, "
+            "Reason, Insurance, Location. Use 'not specified' for missing values."
+        )
+        extractor = _model().with_structured_output(AppointmentDetails)
+        details: AppointmentDetails = extractor.invoke([
+            SystemMessage(content=extract_system),
+            HumanMessage(content=correction_text),
+        ])
+        update["appt_details"] = details
+    else:
+        update["user_info_draft"] = revised
+        current = state.get("user_info_extracted") or {}
+        extract_system = (
+            "Apply the user's correction to the current extracted profile "
+            "fields. Supported fields:\n"
+            "- username: a nickname they want the bot to call them\n"
+            "- insurance: dict with keys 'provider', 'member_id', 'group_id' "
+            "(include only the keys the user mentioned)\n\n"
+            f"Current extracted fields: {current}\n\n"
+            "Return the merged extraction: keep unchanged fields from current "
+            "unless the correction overrides them. Only include supported "
+            "fields. Do not invent values."
+        )
+        extractor = _model().with_structured_output(UserInfoExtracted)
+        extracted: UserInfoExtracted = extractor.invoke([
+            SystemMessage(content=extract_system),
+            HumanMessage(content=correction_text),
+        ])
+        update["user_info_extracted"] = extracted
+
+    return Command(update=update, goto="send_user_confirmation")
 
 def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     """Persist confirmed user-info fields to Supabase via store_info."""
@@ -323,14 +448,153 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
 
     return Command(goto=END)
 
-def appointment_website_search():
-    pass
+def appointment_website_search(
+    state: OneHealthAgentState,
+) -> Command[Literal["check_cookies", "__end__"]]:
+    """Build a Firecrawl query from appt_details, search, pick best site, route on."""
+    appt_details = state["appt_details"]
+    chat_id = state["chat_id"]
 
-def visit_site_and_check_cookies():
-    pass
+    query_system = (
+        "Build a concise web search query to find healthcare appointment "
+        "booking websites. Prioritize practice name, specialty, location, "
+        "and insurance when available. Focus on online booking portals.\n\n"
+        f"Appointment details:\n{appt_details}"
+    )
+    query_model = _model().with_structured_output(FirecrawlSearchQuery)
+    search_query: FirecrawlSearchQuery = query_model.invoke([
+        SystemMessage(content=query_system),
+        HumanMessage(content="Generate the search query."),
+    ])
 
-def request_user_login():
-    pass
+    raw = firecrawl_search.invoke({"query": search_query["query"]})
+    candidates = [
+        {"title": r.title, "url": r.url, "description": r.description or ""}
+        for r in raw.values()
+    ]
 
-def auto_schedule_appointment():
-    pass
+    if not candidates:
+        send_message.invoke({
+            "chat_id": chat_id,
+            "text": "Couldn't find booking sites — try specifying a practice name.",
+        })
+        return Command(goto="correct_info")
+
+    select_system = (
+        "Pick the single best URL for online appointment booking given the "
+        "appointment details. Prefer official practice/hospital patient portals "
+        "over directories (Zocdoc, Healthgrades) unless no official site exists.\n\n"
+        f"Appointment details:\n{appt_details}\n\n"
+        f"Candidates:\n{candidates}"
+    )
+    selector = _model().with_structured_output(WebsiteSelection)
+    selection: WebsiteSelection = selector.invoke([
+        SystemMessage(content=select_system),
+        HumanMessage(content="Select the best booking URL."),
+    ])
+
+    selected_url = selection["url"]
+    candidate_urls = {c["url"] for c in candidates}
+    if selected_url not in candidate_urls:
+        selected_url = candidates[0]["url"]
+
+    send_message.invoke({
+        "chat_id": chat_id,
+        "text": f"Found booking site: {selected_url}",
+    })
+
+    return Command(
+        update={"appt_website": selected_url},
+        goto="check_cookies",
+    )
+
+def check_cookies(
+    state: OneHealthAgentState,
+) -> Command[Literal["schedule_appointment", "start_user_login"]]:
+    """Look up saved Browserbase login context for appt_website, route on result."""
+    chat_id = state["chat_id"]
+    website = state["appt_website"]
+
+    result = check_cookies_tool.invoke({"chat_id": chat_id, "website": website})
+
+    if result["found"]:
+        return Command(
+            update={"browserbase_context_id": result["context_id"]},
+            goto="schedule_appointment",
+        )
+
+    return Command(goto="start_user_login")
+
+
+async def start_user_login(state: OneHealthAgentState) -> dict:
+    """Spin up Browserbase login session and send Telegram Mini App keyboard."""
+    chat_id = state["chat_id"]
+    website = state["appt_website"]
+
+    boot = await start_browserbase_login(website)
+
+    send_message.invoke({
+        "chat_id": chat_id,
+        "text": (
+            f"Log in to {website} so I can book your appointment. "
+            "Tap Open login, sign in, then tap Done. "
+            "I only save cookies — not your password."
+        ),
+        "web_app_url": boot["live_view_url"],
+    })
+
+    return {
+        "browserbase_session_id": boot["session_id"],
+        "browserbase_context_id": boot["context_id"],
+    }
+
+
+async def await_user_login(
+    state: OneHealthAgentState,
+) -> Command[Literal["schedule_appointment"]]:
+    """Wait for user to finish login, persist context, then schedule."""
+    chat_id = state["chat_id"]
+
+    interrupt({"chat_id": chat_id, "prompt": "awaiting_login"})
+
+    await finish_browserbase_login(state["browserbase_session_id"])
+    store_info.invoke({
+        "chat_id": chat_id,
+        "website": state["appt_website"],
+        "context_id": state["browserbase_context_id"],
+    })
+    send_message.invoke({
+        "chat_id": chat_id,
+        "text": "Logged in. Scheduling your appointment...",
+    })
+    return Command(goto="schedule_appointment")
+
+
+async def schedule_appointment(
+    state: OneHealthAgentState,
+) -> Command[Literal["start_user_login", "final_confirmation"]]:
+    """Book appointment via Stagehand using persisted Browserbase context."""
+    chat_id = state["chat_id"]
+    website = state["appt_website"]
+    context_id = state["browserbase_context_id"]
+
+    if not context_id:
+        send_message.invoke({
+            "chat_id": chat_id,
+            "text": "Missing login context — please log in again.",
+        })
+        return Command(goto="start_user_login")
+
+    await book_appointment.ainvoke({
+        "website": website,
+        "chat_id": chat_id,
+        "context_id": context_id,
+        "appointment_details": dict(state["appt_details"]),
+    })
+    return Command(goto="final_confirmation")
+
+def final_confirmation(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """Send final confirmation message to the user."""
+    chat_id = state["chat_id"]
+    send_message.invoke({"chat_id": chat_id, "text": "Appointment scheduled successfully."})
+    return Command(goto=END)

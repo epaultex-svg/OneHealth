@@ -18,10 +18,17 @@ class UserInfoExtracted(TypedDict, total=False):
     username: str
     insurance: dict
 
+class FirecrawlSearchQuery(TypedDict):
+    query: str
+
+class WebsiteSelection(TypedDict):
+    url: str
+
 class OneHealthAgentState(TypedDict):
 
     # inbound message information
     chat_id: str
+    update_id: int
     user_message_content: str
     user_location: dict | None
     username: str
@@ -37,6 +44,8 @@ class OneHealthAgentState(TypedDict):
     user_info_extracted: UserInfoExtracted | None
 
     appt_website: str # firecrawl results
+    browserbase_context_id: str | None
+    browserbase_session_id: str | None
 
     
 
