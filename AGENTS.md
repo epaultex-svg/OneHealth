@@ -40,7 +40,6 @@ Defined in `@state.py`:
 | `message_content` | str | User's inbound text | Yes |
 | `username` | str | User identifier | No |
 | `message_classification` | TextClassification | Intent classification (appointment/user_info) | Yes — cannot recalculate |
-| `confirmation` | bool | User approval to proceed | No |
 | `appt_website` | str | Selected healthcare booking website URL from Firecrawl search | No |
 | `browserbase_context_id` | str \| None | Persisted Browserbase context (auth cookies) | Yes for booking |
 | `browserbase_session_id` | str \| None | Active login session (live view only) | No |
