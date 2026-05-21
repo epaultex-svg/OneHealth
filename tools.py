@@ -157,6 +157,10 @@ async def start_browserbase_login(website: str) -> dict:
         browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
         model_api_key=os.getenv("OPENROUTER_API_KEY"),
     ) as client:
+        await client.sessions.start(
+            model_name="openai/gpt-oss-120b",
+            browserbase_session_id=session_id,
+        )
         await client.sessions.navigate(id=session_id, url=website)
 
     debug_resp = httpx.get(
@@ -184,6 +188,10 @@ async def finish_browserbase_login(session_id: str) -> None:
         browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
         model_api_key=os.getenv("OPENROUTER_API_KEY"),
     ) as client:
+        await client.sessions.start(
+            model_name="openai/gpt-oss-120b",
+            browserbase_session_id=session_id,
+        )
         await client.sessions.end(id=session_id)
     await asyncio.sleep(2)
 
@@ -281,21 +289,23 @@ async def book_appointment(
         browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
         model_api_key=os.getenv("OPENROUTER_API_KEY"),
     ) as client:
-        session = await client.sessions.create(
+        start_response = await client.sessions.start(
             model_name="openai/gpt-oss-120b",
-            browser_settings={
-                "context": {"id": context_id, "persist": True},
+            browserbase_session_create_params={
+                "browser_settings": {"context": {"id": context_id, "persist": True}},
+                "keep_alive": True,
             },
         )
+        session_id = start_response.data.session_id
 
         _telegram_send(chat_id, f"Opening {website}...")
 
         try:
-            await client.sessions.navigate(id=session.id, url=website)
+            await client.sessions.navigate(id=session_id, url=website)
             _telegram_send(chat_id, f"Navigated to {website}. Starting booking agent...")
 
             stream = await client.sessions.execute(
-                id=session.id,
+                id=session_id,
                 execute_options={
                     "instruction": instruction,
                     "max_steps": 25,
@@ -309,20 +319,28 @@ async def book_appointment(
             final_message = ""
             success = False
             async for event in stream:
-                payload = getattr(event, "data", None)
-                etype = getattr(event, "type", "log")
+                data = event.data
 
-                if etype == "log":
-                    text = ""
-                    if isinstance(payload, dict):
-                        text = payload.get("message") or payload.get("text") or ""
+                if event.type == "log":
+                    text = getattr(data, "message", "") or ""
                     if text:
                         _telegram_send(chat_id, f"[Stagehand] {text}")
-                elif etype == "system":
-                    if isinstance(payload, dict):
-                        result = payload.get("result") or {}
-                        final_message = result.get("message", "") or final_message
-                        success = bool(result.get("success", success))
+                elif event.type == "system":
+                    status = getattr(data, "status", "")
+                    if status == "finished":
+                        result = getattr(data, "result", None) or {}
+                        # result is documented as the agent's terminal payload:
+                        # {"success": bool, "message": str, "actions": [...], ...}
+                        if isinstance(result, dict):
+                            final_message = result.get("message", "") or final_message
+                            success = bool(result.get("success", success))
+                        else:
+                            final_message = getattr(result, "message", "") or final_message
+                            success = bool(getattr(result, "success", success))
+                    elif status == "error":
+                        error_msg = getattr(data, "error", "") or "unknown error"
+                        final_message = error_msg
+                        success = False
 
             _telegram_send(
                 chat_id,
@@ -332,10 +350,10 @@ async def book_appointment(
             return {
                 "success": success,
                 "message": final_message,
-                "session_id": session.id,
+                "session_id": session_id,
             }
         finally:
-            await client.sessions.end(id=session.id)
+            await client.sessions.end(id=session_id)
 
 
 @tool

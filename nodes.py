@@ -52,11 +52,30 @@ def _model(temperature: float = 0.0) -> ChatOpenRouter:
 def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent"]]:
     """Read latest Telegram message, register new users, route on location.
 
-    Delegates message reading to read_message(). On first contact stores
-    chat_id and username in Supabase. Routes to 'request_user_location' if
-    new user, else 'classify_intent'.
+    Uses state when LangSmith Studio or a resumed thread already seeded
+    chat_id and user_message_content; otherwise polls Telegram via read_message().
+    On first contact stores chat_id and username in Supabase. Routes to
+    'request_user_location' if new user or missing location, else 'classify_intent'.
     """
-    msg = read_message.invoke({})
+    state_chat_id = state.get("chat_id")
+    state_message = state.get("user_message_content")
+
+    if state_chat_id and state_message:
+        msg = {
+            "chat_id": str(state_chat_id),
+            "user_message_content": state_message,
+            "username": state.get("username") or "",
+            "update_id": state.get("update_id"),
+            "location": state.get("user_location"),
+        }
+    else:
+        msg = read_message.invoke({})
+
+    # @tool serializes {} to the string "{}" which is truthy, so check both.
+    if not msg or msg == "{}":
+        print("No message received")
+        return Command(goto=END)
+
     chat_id = msg["chat_id"]
     username = msg["username"]
     next_node = "classify_intent"
@@ -572,7 +591,7 @@ async def await_user_login(
 
 async def schedule_appointment(
     state: OneHealthAgentState,
-) -> Command[Literal["start_user_login", "final_confirmation"]]:
+) -> Command[Literal["start_user_login", END]]:
     """Book appointment via Stagehand using persisted Browserbase context."""
     chat_id = state["chat_id"]
     website = state["appt_website"]

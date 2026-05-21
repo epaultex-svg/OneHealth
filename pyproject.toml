@@ -14,4 +14,5 @@ dependencies = [
     "firecrawl>=4.26.0",
     "supabase>=2.30.0",
     "stagehand>=3.20.0",
+    "langchain-openai>=1.2.1",
 ]
