@@ -1,5 +1,5 @@
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import START, StateGraph
+from langgraph.graph import START, END, StateGraph
 
 from nodes import (
     appointment_website_search,
@@ -17,9 +17,9 @@ from nodes import (
     start_user_login,
     store_in_supabase,
     check_cookies,
-    final_confirmation,
 )
 from state import OneHealthAgentState
+from langgraph.types import RetryPolicy
 
 
 def build_graph():
@@ -35,19 +35,21 @@ def build_graph():
     workflow.add_node("interpret_user_confirmation", interpret_user_confirmation)
     workflow.add_node("send_correction_query", send_correction_query)
     workflow.add_node("correct_info", correct_info)
-    workflow.add_node("store_in_supabase", store_in_supabase)
-    workflow.add_node("appointment_website_search", appointment_website_search)
+    workflow.add_node("store_in_supabase", store_in_supabase, retry_policy=RetryPolicy(max_retries=3))
+    workflow.add_node("appointment_website_search", appointment_website_search, retry_policy=RetryPolicy(max_retries=3))
     workflow.add_node("check_cookies", check_cookies)
     workflow.add_node("start_user_login", start_user_login)
     workflow.add_node("await_user_login", await_user_login)
     workflow.add_node("schedule_appointment", schedule_appointment)
-    workflow.add_node("final_confirmation", final_confirmation)
 
     workflow.add_edge(START, "start_thread")
     workflow.add_edge("start_user_login", "await_user_login")
+    workflow.add_edge("schedule_appointment", END)
 
     return workflow.compile(checkpointer=InMemorySaver())
 
 
 def main():
-    return build_graph()
+    agent = build_graph()
+    agent.invoke({"chat_id": "1234567890"})
+    
