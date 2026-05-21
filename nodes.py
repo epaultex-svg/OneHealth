@@ -49,14 +49,14 @@ def _model(temperature: float = 0.0) -> ChatOpenRouter:
     )
 
 
-def start_thread() -> Command[Literal["request_user_location", "classify_intent"]]:
+def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent"]]:
     """Read latest Telegram message, register new users, route on location.
 
     Delegates message reading to read_message(). On first contact stores
     chat_id and username in Supabase. Routes to 'request_user_location' if
     new user, else 'classify_intent'.
     """
-    msg = read_message()
+    msg = read_message.invoke({})
     chat_id = msg["chat_id"]
     username = msg["username"]
     next_node = "classify_intent"
@@ -69,7 +69,7 @@ def start_thread() -> Command[Literal["request_user_location", "classify_intent"
         row = client.table("users").select("location").eq("chat_id", chat_id).execute()
 
         if not row.data:
-            store_info(chat_id=chat_id, username=username or None)
+            store_info.invoke({"chat_id": chat_id, "username": username or None})
             next_node = "request_user_location"
         else:
             location = row.data[0].get("location")
@@ -450,7 +450,7 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
 
 def appointment_website_search(
     state: OneHealthAgentState,
-) -> Command[Literal["check_cookies", "__end__"]]:
+) -> Command[Literal["check_cookies", "correct_info"]]:
     """Build a Firecrawl query from appt_details, search, pick best site, route on."""
     appt_details = state["appt_details"]
     chat_id = state["chat_id"]
@@ -585,16 +585,10 @@ async def schedule_appointment(
         })
         return Command(goto="start_user_login")
 
-    await book_appointment.ainvoke({
+    result = await book_appointment.ainvoke({
         "website": website,
         "chat_id": chat_id,
         "context_id": context_id,
         "appointment_details": dict(state["appt_details"]),
     })
-    return Command(goto="final_confirmation")
-
-def final_confirmation(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
-    """Send final confirmation message to the user."""
-    chat_id = state["chat_id"]
-    send_message.invoke({"chat_id": chat_id, "text": "Appointment scheduled successfully."})
-    return Command(goto=END)
+    return Command(update={"book_appointment_result": result}, goto=END)
