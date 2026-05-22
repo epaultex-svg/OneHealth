@@ -11,6 +11,20 @@ from stagehand import AsyncStagehand
 from supabase import create_client
 
 
+load_dotenv()
+
+STAGEHAND_MODEL = os.getenv("STAGEHAND_MODEL", "google/gemini-2.5-flash")
+STAGEHAND_BOOKING_MODEL = os.getenv(
+    "STAGEHAND_BOOKING_MODEL",
+    "google/gemini-3-flash-preview",
+)
+
+
+def _stagehand_client() -> AsyncStagehand:
+    load_dotenv()
+    return AsyncStagehand(browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"))
+
+
 def _normalize_host(website: str) -> str:
     """Lowercased hostname without leading 'www.'. Falls back to raw string."""
     if not website:
@@ -38,6 +52,11 @@ def _telegram_send(chat_id: str, text: str) -> None:
         )
     except Exception:
         pass
+
+
+async def _telegram_send_async(chat_id: str, text: str) -> None:
+    await asyncio.to_thread(_telegram_send, chat_id, text)
+
 
 @tool
 def read_message() -> dict:
@@ -133,41 +152,46 @@ async def start_browserbase_login(website: str) -> dict:
     headers = _browserbase_headers()
     base = "https://api.browserbase.com/v1"
 
-    ctx_resp = httpx.post(f"{base}/contexts", headers=headers, json={}, timeout=30.0)
-    ctx_resp.raise_for_status()
-    context_id = ctx_resp.json()["id"]
-
+    project_id = os.getenv("BROWSERBASE_PROJECT_ID")
+    context_body: dict = {}
+    if project_id:
+        context_body["projectId"] = project_id
     session_body: dict = {
         "keepAlive": True,
         "browserSettings": {
-            "context": {"id": context_id, "persist": True},
+            "context": {"persist": True},
         },
     }
-    project_id = os.getenv("BROWSERBASE_PROJECT_ID")
     if project_id:
         session_body["projectId"] = project_id
 
-    sess_resp = httpx.post(
-        f"{base}/sessions", headers=headers, json=session_body, timeout=30.0
-    )
-    sess_resp.raise_for_status()
-    session_id = sess_resp.json()["id"]
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
+        ctx_resp = await http_client.post(
+            f"{base}/contexts", headers=headers, json=context_body
+        )
+        ctx_resp.raise_for_status()
+        context_id = ctx_resp.json()["id"]
 
-    async with AsyncStagehand(
-        browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
-        model_api_key=os.getenv("OPENROUTER_API_KEY"),
-    ) as client:
+        session_body["browserSettings"]["context"]["id"] = context_id
+        sess_resp = await http_client.post(
+            f"{base}/sessions", headers=headers, json=session_body
+        )
+        sess_resp.raise_for_status()
+        session_id = sess_resp.json()["id"]
+
+    async with _stagehand_client() as client:
         await client.sessions.start(
-            model_name="openai/gpt-oss-120b",
+            model_name=STAGEHAND_MODEL,
             browserbase_session_id=session_id,
         )
         await client.sessions.navigate(id=session_id, url=website)
 
-    debug_resp = httpx.get(
-        f"{base}/sessions/{session_id}/debug", headers=headers, timeout=30.0
-    )
-    debug_resp.raise_for_status()
-    debug = debug_resp.json()
+    async with httpx.AsyncClient(timeout=30.0) as http_client:
+        debug_resp = await http_client.get(
+            f"{base}/sessions/{session_id}/debug", headers=headers
+        )
+        debug_resp.raise_for_status()
+        debug = debug_resp.json()
     live_view_url = debug.get("debuggerFullscreenUrl") or ""
     if not live_view_url:
         pages = debug.get("pages") or []
@@ -184,12 +208,9 @@ async def start_browserbase_login(website: str) -> dict:
 async def finish_browserbase_login(session_id: str) -> None:
     """End the login session so persisted cookies flush to the context."""
     load_dotenv()
-    async with AsyncStagehand(
-        browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
-        model_api_key=os.getenv("OPENROUTER_API_KEY"),
-    ) as client:
+    async with _stagehand_client() as client:
         await client.sessions.start(
-            model_name="openai/gpt-oss-120b",
+            model_name=STAGEHAND_MODEL,
             browserbase_session_id=session_id,
         )
         await client.sessions.end(id=session_id)
@@ -282,15 +303,16 @@ async def book_appointment(
         f"{appointment_details}. The browser session is already logged in via "
         "persisted cookies. Navigate to the booking page, select the requested "
         "provider, appointment type, date, and time, then submit the booking. "
+        "The appointment form may be embedded inside an iframe. If it is, use "
+        "Stagehand's iframe-aware and visual interaction tools to continue; do "
+        "not stop only because the form is in an iframe. "
         "Confirm the booking succeeded before finishing."
     )
 
-    async with AsyncStagehand(
-        browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"),
-        model_api_key=os.getenv("OPENROUTER_API_KEY"),
-    ) as client:
+    async with _stagehand_client() as client:
         start_response = await client.sessions.start(
-            model_name="openai/gpt-oss-120b",
+            model_name=STAGEHAND_BOOKING_MODEL,
+            experimental=True,
             browserbase_session_create_params={
                 "browser_settings": {"context": {"id": context_id, "persist": True}},
                 "keep_alive": True,
@@ -298,11 +320,11 @@ async def book_appointment(
         )
         session_id = start_response.data.session_id
 
-        _telegram_send(chat_id, f"Opening {website}...")
+        await _telegram_send_async(chat_id, f"Opening {website}...")
 
         try:
             await client.sessions.navigate(id=session_id, url=website)
-            _telegram_send(chat_id, f"Navigated to {website}. Starting booking agent...")
+            await _telegram_send_async(chat_id, f"Navigated to {website}. Starting booking agent...")
 
             stream = await client.sessions.execute(
                 id=session_id,
@@ -310,7 +332,11 @@ async def book_appointment(
                     "instruction": instruction,
                     "max_steps": 25,
                 },
-                agent_config={"model": "openai/gpt-oss-120b"},
+                agent_config={
+                    "model": STAGEHAND_BOOKING_MODEL,
+                    "execution_model": STAGEHAND_BOOKING_MODEL,
+                    "mode": "hybrid",
+                },
                 timeout=600.0,
                 stream_response=True,
                 x_stream_response="true",
@@ -324,7 +350,7 @@ async def book_appointment(
                 if event.type == "log":
                     text = getattr(data, "message", "") or ""
                     if text:
-                        _telegram_send(chat_id, f"[Stagehand] {text}")
+                        await _telegram_send_async(chat_id, f"[Stagehand] {text}")
                 elif event.type == "system":
                     status = getattr(data, "status", "")
                     if status == "finished":
@@ -342,7 +368,7 @@ async def book_appointment(
                         final_message = error_msg
                         success = False
 
-            _telegram_send(
+            await _telegram_send_async(
                 chat_id,
                 f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ''}",
             )

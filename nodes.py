@@ -49,7 +49,51 @@ def _model(temperature: float = 0.0) -> ChatOpenRouter:
     )
 
 
-def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent"]]:
+def _normalize_resume_message(resume: object, state: OneHealthAgentState) -> dict | None:
+    """Convert Studio resume payloads into the Telegram message shape."""
+    chat_id = str(state.get("chat_id", ""))
+    update_id = state.get("update_id")
+    username = state.get("username") or ""
+
+    def message(content: str, location: dict | None = None) -> dict:
+        return {
+            "chat_id": chat_id,
+            "user_message_content": content,
+            "username": username,
+            "update_id": update_id,
+            "location": location,
+        }
+
+    if isinstance(resume, str):
+        content = resume.strip()
+        return message(content) if content else None
+
+    if not isinstance(resume, dict) or not resume:
+        return None
+
+    location = resume.get("location")
+    for key in ("user_message_content", "text", "message", "content"):
+        value = resume.get(key)
+        if isinstance(value, str) and value.strip():
+            return message(value.strip(), location if isinstance(location, dict) else None)
+
+    raw_message = resume.get("message")
+    if isinstance(raw_message, dict):
+        text = raw_message.get("text")
+        if isinstance(text, str) and text.strip():
+            return message(text.strip(), location if isinstance(location, dict) else None)
+
+    if isinstance(location, dict):
+        return message(str(state.get("user_message_content") or ""), location)
+
+    return None
+
+
+def _resume_or_telegram_message(resume: object, state: OneHealthAgentState) -> dict:
+    return _normalize_resume_message(resume, state) or read_message.invoke({})
+
+
+def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent", "__end__"]]:
     """Read latest Telegram message, register new users, route on location.
 
     Uses state when LangSmith Studio or a resumed thread already seeded
@@ -113,10 +157,11 @@ def request_user_location(state: OneHealthAgentState) -> Command[Literal["classi
     """Prompt user for location, wait for reply, store or skip, then continue."""
     chat_id = state["chat_id"]
 
-    reply = interrupt({
+    resume = interrupt({
         "chat_id": chat_id,
         "prompt": "Please share your location for best results.",
     })
+    reply = _normalize_resume_message(resume, state) or resume
 
     location = reply.get("location") if isinstance(reply, dict) else None
 
@@ -137,9 +182,9 @@ def classify_intent(
     """Wait for user reply, fetch it via Telegram, classify intent, route on result."""
     chat_id = state["chat_id"]
 
-    interrupt({"chat_id": chat_id, "prompt": "awaiting_user_message"})
+    resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_user_message"})
 
-    msg = read_message.invoke({})
+    msg = _resume_or_telegram_message(resume, state)
 
     system = (
         "Classify the user's message into exactly one intent:\n"
@@ -325,9 +370,9 @@ def interpret_user_confirmation(
     classification = state["user_message_classification"]
     intent = classification["intent"]
 
-    interrupt({"chat_id": chat_id, "prompt": "awaiting_user_confirmation"})
+    resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_user_confirmation"})
 
-    reply = read_message.invoke({})
+    reply = _resume_or_telegram_message(resume, state)
     reply_text = reply["user_message_content"]
 
     system = (
@@ -372,9 +417,9 @@ def correct_info(
     chat_id = state["chat_id"]
     intent = state["user_message_classification"]["intent"]
 
-    interrupt({"chat_id": chat_id, "prompt": "awaiting_correction"})
+    resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_correction"})
 
-    msg = read_message.invoke({})
+    msg = _resume_or_telegram_message(resume, state)
     correction_text = msg["user_message_content"]
 
     if intent == "appointment":
@@ -556,7 +601,7 @@ async def start_user_login(state: OneHealthAgentState) -> dict:
 
     boot = await start_browserbase_login(website)
 
-    send_message.invoke({
+    await send_message.ainvoke({
         "chat_id": chat_id,
         "text": (
             f"Log in to {website} so I can book your appointment. "
@@ -578,15 +623,15 @@ async def await_user_login(
     """Wait for user to finish login, persist context, then schedule."""
     chat_id = state["chat_id"]
 
-    interrupt({"chat_id": chat_id, "prompt": "awaiting_login"})
+    _ = interrupt({"chat_id": chat_id, "prompt": "awaiting_login"})
 
     await finish_browserbase_login(state["browserbase_session_id"])
-    store_info.invoke({
+    await store_info.ainvoke({
         "chat_id": chat_id,
         "website": state["appt_website"],
         "context_id": state["browserbase_context_id"],
     })
-    send_message.invoke({
+    await send_message.ainvoke({
         "chat_id": chat_id,
         "text": "Logged in. Scheduling your appointment...",
     })
@@ -595,14 +640,14 @@ async def await_user_login(
 
 async def schedule_appointment(
     state: OneHealthAgentState,
-) -> Command[Literal["start_user_login", END]]:
+) -> Command[Literal["start_user_login", "__end__"]]:
     """Book appointment via Stagehand using persisted Browserbase context."""
     chat_id = state["chat_id"]
     website = state["appt_website"]
     context_id = state["browserbase_context_id"]
 
     if not context_id:
-        send_message.invoke({
+        await send_message.ainvoke({
             "chat_id": chat_id,
             "text": "Missing login context — please log in again.",
         })

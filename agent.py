@@ -1,4 +1,3 @@
-from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import START, END, StateGraph
 
 from nodes import (
@@ -22,7 +21,7 @@ from state import OneHealthAgentState
 from langgraph.types import RetryPolicy
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     """Build and compile the OneHealth agent workflow."""
     workflow = StateGraph(OneHealthAgentState)
 
@@ -46,6 +45,8 @@ def build_graph():
     workflow.add_edge("start_user_login", "await_user_login")
     workflow.add_edge("schedule_appointment", END)
 
+    if checkpointer is not None:
+        return workflow.compile(checkpointer=checkpointer)
     return workflow.compile()
 
 
@@ -53,4 +54,3 @@ graph = build_graph()
 
 if __name__ == "__main__":
     graph.invoke({}, config={"configurable": {"thread_id": "1"}})
-    
