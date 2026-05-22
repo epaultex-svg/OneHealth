@@ -486,10 +486,14 @@ def appointment_website_search(
         HumanMessage(content="Generate the search query."),
     ])
 
-    raw = firecrawl_search.invoke({"query": search_query["query"]})
+    query = search_query.get("query") if isinstance(search_query, dict) else None
+    if not query:
+        query = " ".join(str(v) for v in appt_details.values() if v and v != "not specified")
+
+    raw = firecrawl_search.invoke({"query": query})
     candidates = [
         {"title": r.title, "url": r.url, "description": r.description or ""}
-        for r in raw.values()
+        for r in (raw.values() if raw else [])
     ]
 
     if not candidates:
@@ -512,7 +516,7 @@ def appointment_website_search(
         HumanMessage(content="Select the best booking URL."),
     ])
 
-    selected_url = selection["url"]
+    selected_url = selection.get("url") if isinstance(selection, dict) else None
     candidate_urls = {c["url"] for c in candidates}
     if selected_url not in candidate_urls:
         selected_url = candidates[0]["url"]
