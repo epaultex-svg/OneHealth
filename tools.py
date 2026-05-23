@@ -13,34 +13,6 @@ from supabase import create_client
 
 load_dotenv()
 
-STAGEHAND_MODEL = os.getenv("STAGEHAND_MODEL", "google/gemini-2.5-flash")
-STAGEHAND_BOOKING_MODEL = os.getenv(
-    "STAGEHAND_BOOKING_MODEL",
-    "google/gemini-3-flash-preview",
-)
-
-
-def _stagehand_client() -> AsyncStagehand:
-    load_dotenv()
-    return AsyncStagehand(browserbase_api_key=os.getenv("BROWSERBASE_API_KEY"))
-
-
-def _normalize_host(website: str) -> str:
-    """Lowercased hostname without leading 'www.'. Falls back to raw string."""
-    if not website:
-        return ""
-    parsed = urlparse(website if "://" in website else f"//{website}", scheme="")
-    host = (parsed.hostname or website).lower().strip()
-    return host[4:] if host.startswith("www.") else host
-
-def _browserbase_headers() -> dict[str, str]:
-    load_dotenv()
-    return {
-        "Content-Type": "application/json",
-        "X-BB-API-Key": os.getenv("BROWSERBASE_API_KEY", ""),
-    }
-
-
 def _telegram_send(chat_id: str, text: str) -> None:
     """Push a status line to the user via Telegram. Best-effort, swallows errors."""
     token = os.getenv("TELEGRAM_API_TOKEN")
@@ -142,80 +114,6 @@ def send_message(chat_id: str, text: str, web_app_url: str | None = None) -> dic
         "message_thread_id": results.get("message_thread_id"),
     }
 
-
-async def start_browserbase_login(website: str) -> dict:
-    """Create a persisted Browserbase context/session and open the login page.
-
-    Returns session_id, context_id, and live_view_url for Telegram Mini App.
-    """
-    load_dotenv()
-    headers = _browserbase_headers()
-    base = "https://api.browserbase.com/v1"
-
-    project_id = os.getenv("BROWSERBASE_PROJECT_ID")
-    context_body: dict = {}
-    if project_id:
-        context_body["projectId"] = project_id
-    session_body: dict = {
-        "keepAlive": True,
-        "browserSettings": {
-            "context": {"persist": True},
-        },
-    }
-    if project_id:
-        session_body["projectId"] = project_id
-
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
-        ctx_resp = await http_client.post(
-            f"{base}/contexts", headers=headers, json=context_body
-        )
-        ctx_resp.raise_for_status()
-        context_id = ctx_resp.json()["id"]
-
-        session_body["browserSettings"]["context"]["id"] = context_id
-        sess_resp = await http_client.post(
-            f"{base}/sessions", headers=headers, json=session_body
-        )
-        sess_resp.raise_for_status()
-        session_id = sess_resp.json()["id"]
-
-    async with _stagehand_client() as client:
-        await client.sessions.start(
-            model_name=STAGEHAND_MODEL,
-            browserbase_session_id=session_id,
-        )
-        await client.sessions.navigate(id=session_id, url=website)
-
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
-        debug_resp = await http_client.get(
-            f"{base}/sessions/{session_id}/debug", headers=headers
-        )
-        debug_resp.raise_for_status()
-        debug = debug_resp.json()
-    live_view_url = debug.get("debuggerFullscreenUrl") or ""
-    if not live_view_url:
-        pages = debug.get("pages") or []
-        if pages:
-            live_view_url = pages[0].get("debuggerFullscreenUrl") or ""
-
-    return {
-        "session_id": session_id,
-        "context_id": context_id,
-        "live_view_url": live_view_url,
-    }
-
-
-async def finish_browserbase_login(session_id: str) -> None:
-    """End the login session so persisted cookies flush to the context."""
-    load_dotenv()
-    async with _stagehand_client() as client:
-        await client.sessions.start(
-            model_name=STAGEHAND_MODEL,
-            browserbase_session_id=session_id,
-        )
-        await client.sessions.end(id=session_id)
-    await asyncio.sleep(2)
-
 @tool
 def firecrawl_search(query: str) -> dict:
     """Search relevant healthcare websites using Firecrawl."""
@@ -231,47 +129,6 @@ def firecrawl_search(query: str) -> dict:
 
 
 
-@tool
-def check_cookies_tool(chat_id: str, website: str) -> dict:
-    """Look up a Browserbase context for `website` saved under this user.
-
-    Scans the `browserbase_context_ids` array on the user's Supabase row and
-    returns the first entry whose stored website shares a hostname with
-    `website` (case-insensitive, ignoring `www.`).
-
-    Returns:
-        Dict with `found` (bool), `context_id` (str | None), `website` (str | None).
-    """
-    load_dotenv()
-    client = create_client(
-        os.getenv("NEXT_PUBLIC_SUPABASE_URL"),
-        os.getenv("NEXT_PRIVATE_SUPABASE_API_KEY"),
-    )
-
-    target_host = _normalize_host(website)
-    miss = {"found": False, "context_id": None, "website": None}
-    if not target_host:
-        return miss
-
-    result = (
-        client.table("users")
-        .select("browserbase_context_ids")
-        .eq("chat_id", chat_id)
-        .execute()
-    )
-    if not result.data:
-        return miss
-
-    for entry in result.data[0].get("browserbase_context_ids") or []:
-        stored = entry.get("website")
-        if _normalize_host(stored) == target_host:
-            return {
-                "found": True,
-                "context_id": entry.get("context_id"),
-                "website": stored,
-            }
-
-    return miss
 
 @tool
 async def book_appointment(
@@ -280,111 +137,7 @@ async def book_appointment(
     context_id: str,
     appointment_details: dict,
 ) -> dict:
-    """Book a doctor's appointment via Stagehand on the given website.
-
-    Assumes a Browserbase Context (context_id) already holds the auth cookies
-    for `website`. Streams Stagehand events back to the user via Telegram so the
-    LangGraph bot can narrate progress live.
-
-    Args:
-        website: Target booking site URL.
-        chat_id: Telegram chat to stream updates to.
-        context_id: Browserbase Context ID with persisted login cookies.
-        appointment_details: Dict describing the appointment to book
-            (e.g. provider, type, date, time).
-
-    Returns:
-        Dict with `success` (bool), `message` (str), and `session_id` (str).
-    """
-    load_dotenv()
-
-    instruction = (
-        f"""Book a doctor's appointment on {website}.
-
-        Appointment details, including any required patient details:
-        {appointment_details}
-
-        Follow these rules:
-        1. Find and click the link or button to start booking the appointment. Look for text like "book", "make", "schedule", "request", and "appointment".
-        2. Fill relevant fields with exact values from appointment_details. Different websites ask questions in different orders. If the form is inside an iframe, use iframe-aware tools to fill it.
-        3. Use appointment_details as the only source of truth for every form value.
-        4. Do not invent, assume, or use placeholder information. Never enter fake values such as Jane Doe, 555-555-5555, test emails, made-up dates of birth, addresses, insurance IDs, or patient details.
-        5. If a required field is not present in appointment_details, stop immediately and return failure with a clear message naming the missing field.
-        6. After all required fields are filled, click the final visible button to submit, request, schedule, or book the appointment. Then wait for a confirmation page or confirmation message before finishing."""
-    )
-
-    async with _stagehand_client() as client:
-        start_response = await client.sessions.start(
-            model_name=STAGEHAND_BOOKING_MODEL,
-            experimental=True,
-            browserbase_session_create_params={
-                "browser_settings": {"context": {"id": context_id, "persist": True}},
-                "keep_alive": True,
-            },
-        )
-        session_id = start_response.data.session_id
-
-        await _telegram_send_async(chat_id, f"Opening {website}...")
-
-        try:
-            await client.sessions.navigate(id=session_id, url=website)
-            await _telegram_send_async(chat_id, f"Navigated to {website}. Starting booking agent...")
-
-            stream = await client.sessions.execute(
-                id=session_id,
-                execute_options={
-                    "instruction": instruction,
-                    "max_steps": 60,
-                },
-                agent_config={
-                    "model": STAGEHAND_BOOKING_MODEL,
-                    "execution_model": STAGEHAND_BOOKING_MODEL,
-                    "mode": "hybrid",
-                },
-                timeout=600.0,
-                stream_response=True,
-                x_stream_response="true",
-            )
-
-            final_message = ""
-            success = False
-            async for event in stream:
-                data = event.data
-
-                if event.type == "log":
-                    text = getattr(data, "message", "") or ""
-                    if text:
-                        await _telegram_send_async(chat_id, f"[Stagehand] {text}")
-                elif event.type == "system":
-                    status = getattr(data, "status", "")
-                    if status == "finished":
-                        result = getattr(data, "result", None) or {}
-                        # result is documented as the agent's terminal payload:
-                        # {"success": bool, "message": str, "actions": [...], ...}
-                        if isinstance(result, dict):
-                            final_message = result.get("message", "") or final_message
-                            success = bool(result.get("success", success))
-                        else:
-                            final_message = getattr(result, "message", "") or final_message
-                            success = bool(getattr(result, "success", success))
-                    elif status == "error":
-                        error_msg = getattr(data, "error", "") or "unknown error"
-                        final_message = error_msg
-                        success = False
-
-            await _telegram_send_async(
-                chat_id,
-                f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ''}",
-            )
-
-
-            return {
-                "success": success,
-                "message": final_message,
-                "session_id": session_id,
-            }
-        finally:
-            await client.sessions.end(id=session_id)
+    pass
 
 
 @tool
