@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 import httpx
@@ -32,6 +33,42 @@ def _normalize_host(website: str) -> str:
     parsed = urlparse(website if "://" in website else f"//{website}", scheme="")
     host = (parsed.hostname or website).lower().strip()
     return host[4:] if host.startswith("www.") else host
+
+
+def _missing_fields_from_message(message: str) -> list[str]:
+    """Best-effort parse when Stagehand returns prose instead of metadata."""
+    if not message:
+        return []
+
+    lowered = message.lower()
+    if "missing" not in lowered and "required" not in lowered:
+        return []
+
+    match = re.search(
+        r"specifically,?(?: the form)? required\s+([^.;\n]+)",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        match = re.search(
+            r"missing (?:required )?(?:fields?|information)[:\-]?\s*([^.;\n]+)",
+            message,
+            flags=re.IGNORECASE,
+        )
+    if not match:
+        match = re.search(r"\(([^)]+)\)", message)
+        if match and re.fullmatch(r"\s*rule\s+\d+\s*", match.group(1), flags=re.IGNORECASE):
+            match = None
+    if not match:
+        return []
+
+    raw_fields = re.sub(r"\s+and\s+", ", ", match.group(1), flags=re.IGNORECASE)
+    raw_fields = re.sub(r"^(several )?(required )?fields?\s+", "", raw_fields, flags=re.IGNORECASE)
+    return [
+        re.sub(r"^the\s+", "", field.strip(" ."), flags=re.IGNORECASE)
+        for field in raw_fields.split(",")
+        if field.strip(" .")
+    ]
 
 def _browserbase_headers() -> dict[str, str]:
     load_dotenv()
@@ -309,8 +346,10 @@ async def book_appointment(
         2. Fill relevant fields with exact values from appointment_details. Different websites ask questions in different orders. If the form is inside an iframe, use iframe-aware tools to fill it.
         3. Use appointment_details as the only source of truth for every form value.
         4. Do not invent, assume, or use placeholder information. Never enter fake values such as Jane Doe, 555-555-5555, test emails, made-up dates of birth, addresses, insurance IDs, or patient details.
-        5. If a required field is not present in appointment_details, stop immediately and return failure with a clear message naming the missing field.
-        6. After all required fields are filled, click the final visible button to submit, request, schedule, or book the appointment. Then wait for a confirmation page or confirmation message before finishing."""
+        5. If a required field is not present in appointment_details, stop immediately and return only this JSON object:
+           {{"success": false, "needs_user_input": true, "missing_fields": ["field name"], "message": "I need <field name> to continue."}}
+        6. After all required fields are filled, click the final visible button to submit, request, schedule, or book the appointment. Then wait for a confirmation page or confirmation message before finishing.
+        7. Your final result must include "success", "message", "needs_user_input", and "missing_fields"."""
     )
 
     async with _stagehand_client() as client:
@@ -348,6 +387,8 @@ async def book_appointment(
 
             final_message = ""
             success = False
+            needs_user_input = False
+            missing_fields: list[str] = []
             async for event in stream:
                 data = event.data
 
@@ -364,24 +405,43 @@ async def book_appointment(
                         if isinstance(result, dict):
                             final_message = result.get("message", "") or final_message
                             success = bool(result.get("success", success))
+                            needs_user_input = bool(result.get("needs_user_input", needs_user_input))
+                            raw_missing = result.get("missing_fields") or []
+                            if isinstance(raw_missing, list):
+                                missing_fields = [str(field) for field in raw_missing if field]
+                        elif isinstance(result, str):
+                            final_message = result or final_message
                         else:
                             final_message = getattr(result, "message", "") or final_message
                             success = bool(getattr(result, "success", success))
+                            needs_user_input = bool(getattr(result, "needs_user_input", needs_user_input))
+                            raw_missing = getattr(result, "missing_fields", []) or []
+                            if isinstance(raw_missing, list):
+                                missing_fields = [str(field) for field in raw_missing if field]
                     elif status == "error":
                         error_msg = getattr(data, "error", "") or "unknown error"
                         final_message = error_msg
                         success = False
 
-            await _telegram_send_async(
-                chat_id,
-                f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ''}",
-            )
+            if not needs_user_input and not success:
+                inferred_missing_fields = _missing_fields_from_message(final_message)
+                if inferred_missing_fields:
+                    needs_user_input = True
+                    missing_fields = inferred_missing_fields
+
+            if not needs_user_input:
+                await _telegram_send_async(
+                    chat_id,
+                    f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ''}",
+                )
 
 
             return {
                 "success": success,
                 "message": final_message,
                 "session_id": session_id,
+                "needs_user_input": needs_user_input,
+                "missing_fields": missing_fields,
             }
         finally:
             await client.sessions.end(id=session_id)

@@ -13,16 +13,33 @@ class AppointmentDetails(TypedDict):
         Reason: str
         Insurance: str
         Location: str
+        # temporary for dev
+        birthdate: str
+        sex: str
+        address: str
+        phone: str
+        patient_name: str
+        email: str
+        relation_to_patient: str
+        please_contact_me_by: str
 
 class UserInfoExtracted(TypedDict, total=False):
     username: str
     insurance: dict
+    birthdate: str
+    sex: str
+    address: str
+    phone: str    
+
 
 class FirecrawlSearchQuery(TypedDict):
     query: str
 
 class WebsiteSelection(TypedDict):
     url: str
+
+class BookingInfoExtracted(TypedDict):
+    details: dict
 
 class OneHealthAgentState(TypedDict):
 
@@ -39,6 +56,8 @@ class OneHealthAgentState(TypedDict):
     appt_details: AppointmentDetails
     appt_draft: str
     book_appointment_result: dict | None
+    booking_extra_details: dict
+    booking_input_attempts: int
 
     # user info storage
     user_info_draft: str

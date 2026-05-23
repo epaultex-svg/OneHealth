@@ -16,6 +16,7 @@ from supabase import create_client
 
 from state import (
     AppointmentDetails,
+    BookingInfoExtracted,
     ConfirmationDecision,
     FirecrawlSearchQuery,
     OneHealthAgentState,
@@ -91,6 +92,46 @@ def _normalize_resume_message(resume: object, state: OneHealthAgentState) -> dic
 
 def _resume_or_telegram_message(resume: object, state: OneHealthAgentState) -> dict:
     return _normalize_resume_message(resume, state) or read_message.invoke({})
+
+
+_MISSING_DETAIL_VALUES = {"", "not specified", "none", "unknown", "n/a", "na", "null"}
+_REQUIRED_BOOKING_FIELDS = [
+    ("patient_name", "patient name", ("Patient's Name", "patient's name", "Patient Name", "patient name", "name")),
+    ("birthdate", "birth date", ("Birth Date", "birth date", "date of birth", "dob")),
+    ("phone", "phone number", ("Phone", "phone number")),
+    ("email", "email address", ("Email", "email address")),
+    (
+        "relation_to_patient",
+        "relationship to patient",
+        ("Relation to Patient", "relationship to patient", "relationship to the patient"),
+    ),
+    (
+        "please_contact_me_by",
+        "preferred contact method",
+        ("Please Contact Me By", "preferred contact method", "please contact me by"),
+    ),
+    ("Location", "preferred location", ("location", "preferred location")),
+    ("Insurance", "insurance type", ("insurance", "insurance type")),
+]
+
+
+def _has_booking_detail(details: dict, key: str, aliases: tuple[str, ...]) -> bool:
+    for field in (key, *aliases):
+        value = details.get(field)
+        if isinstance(value, str):
+            if value.strip().lower() not in _MISSING_DETAIL_VALUES:
+                return True
+        elif value:
+            return True
+    return False
+
+
+def _missing_booking_fields(details: dict) -> list[str]:
+    return [
+        label
+        for key, label, aliases in _REQUIRED_BOOKING_FIELDS
+        if not _has_booking_detail(details, key, aliases)
+    ]
 
 
 def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent", "__end__"]]:
@@ -640,7 +681,7 @@ async def await_user_login(
 
 async def schedule_appointment(
     state: OneHealthAgentState,
-) -> Command[Literal["start_user_login", "__end__"]]:
+) -> Command[Literal["start_user_login", "send_booking_info_request", "__end__"]]:
     """Book appointment via Stagehand using persisted Browserbase context."""
     chat_id = state["chat_id"]
     website = state["appt_website"]
@@ -653,10 +694,132 @@ async def schedule_appointment(
         })
         return Command(goto="start_user_login")
 
+    appointment_details = {
+        **dict(state["appt_details"]),
+        **(state.get("booking_extra_details") or {}),
+    }
+    missing_fields = _missing_booking_fields(appointment_details)
+    if missing_fields:
+        attempts = int(state.get("booking_input_attempts") or 0) + 1
+        result = {
+            "success": False,
+            "message": "Missing booking details.",
+            "session_id": None,
+            "needs_user_input": True,
+            "missing_fields": missing_fields,
+        }
+        if attempts >= 3:
+            await send_message.ainvoke({
+                "chat_id": chat_id,
+                "text": (
+                    "I still do not have enough information to book this. "
+                    f"Missing: {', '.join(missing_fields)}."
+                ),
+            })
+            return Command(
+                update={
+                    "book_appointment_result": result,
+                    "booking_input_attempts": attempts,
+                },
+                goto=END,
+            )
+
+        return Command(
+            update={
+                "book_appointment_result": result,
+                "booking_input_attempts": attempts,
+            },
+            goto="send_booking_info_request",
+        )
+
     result = await book_appointment.ainvoke({
         "website": website,
         "chat_id": chat_id,
         "context_id": context_id,
-        "appointment_details": dict(state["appt_details"]),
+        "appointment_details": appointment_details,
     })
+
+    if result.get("needs_user_input"):
+        attempts = int(state.get("booking_input_attempts") or 0) + 1
+        if attempts >= 3:
+            missing = ", ".join(result.get("missing_fields") or [])
+            await send_message.ainvoke({
+                "chat_id": chat_id,
+                "text": (
+                    "I still do not have enough information to book this. "
+                    f"Missing: {missing or 'required appointment details'}."
+                ),
+            })
+            return Command(
+                update={
+                    "book_appointment_result": result,
+                    "booking_input_attempts": attempts,
+                },
+                goto=END,
+            )
+
+        return Command(
+            update={
+                "book_appointment_result": result,
+                "booking_input_attempts": attempts,
+            },
+            goto="send_booking_info_request",
+        )
+
     return Command(update={"book_appointment_result": result}, goto=END)
+
+
+async def send_booking_info_request(
+    state: OneHealthAgentState,
+) -> dict:
+    """Ask user for missing booking fields via Telegram."""
+    chat_id = state["chat_id"]
+    result = state.get("book_appointment_result") or {}
+    missing_fields = result.get("missing_fields") or []
+    missing = ", ".join(missing_fields) if missing_fields else "required appointment details"
+
+    await send_message.ainvoke({
+        "chat_id": chat_id,
+        "text": f"I need this before I can finish booking: {missing}. Please reply with the details.",
+    })
+    return {}
+
+
+async def await_booking_info(
+    state: OneHealthAgentState,
+) -> Command[Literal["schedule_appointment"]]:
+    """Wait for missing booking info, merge into details, then retry booking."""
+    chat_id = state["chat_id"]
+    result = state.get("book_appointment_result") or {}
+    missing_fields = result.get("missing_fields") or []
+
+    resume = interrupt({
+        "chat_id": chat_id,
+        "prompt": "awaiting_booking_info",
+        "missing_fields": missing_fields,
+    })
+    msg = _resume_or_telegram_message(resume, state)
+    reply_text = msg["user_message_content"]
+
+    extractor = _model().with_structured_output(BookingInfoExtracted)
+    extracted: BookingInfoExtracted = await extractor.ainvoke([
+        SystemMessage(content=(
+            "Extract values from the user's reply for these missing appointment "
+            f"fields: {missing_fields}.\n\n"
+            "Return a dict named details. Include only fields the user answered. "
+            "Use the exact missing field names as keys when possible."
+        )),
+        HumanMessage(content=reply_text),
+    ])
+
+    return Command(
+        update={
+            "booking_extra_details": {
+                **(state.get("booking_extra_details") or {}),
+                **(extracted.get("details") or {}),
+            },
+            "user_message_content": reply_text,
+            "update_id": msg["update_id"],
+        },
+        goto="schedule_appointment",
+    )

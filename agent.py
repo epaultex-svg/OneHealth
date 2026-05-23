@@ -1,7 +1,8 @@
-from langgraph.graph import START, END, StateGraph
+from langgraph.graph import START, StateGraph
 
 from nodes import (
     appointment_website_search,
+    await_booking_info,
     await_user_login,
     classify_intent,
     correct_info,
@@ -10,6 +11,7 @@ from nodes import (
     interpret_user_confirmation,
     request_user_location,
     schedule_appointment,
+    send_booking_info_request,
     send_correction_query,
     send_user_confirmation,
     start_thread,
@@ -40,10 +42,12 @@ def build_graph(checkpointer=None):
     workflow.add_node("start_user_login", start_user_login)
     workflow.add_node("await_user_login", await_user_login)
     workflow.add_node("schedule_appointment", schedule_appointment)
+    workflow.add_node("send_booking_info_request", send_booking_info_request)
+    workflow.add_node("await_booking_info", await_booking_info)
 
     workflow.add_edge(START, "start_thread")
     workflow.add_edge("start_user_login", "await_user_login")
-    workflow.add_edge("schedule_appointment", END)
+    workflow.add_edge("send_booking_info_request", "await_booking_info")
 
     if checkpointer is not None:
         return workflow.compile(checkpointer=checkpointer)
