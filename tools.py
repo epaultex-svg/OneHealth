@@ -299,14 +299,18 @@ async def book_appointment(
     load_dotenv()
 
     instruction = (
-        f"Book a doctor's appointment on {website} with the following details: "
-        f"{appointment_details}. The browser session is already logged in via "
-        "persisted cookies. Navigate to the booking page, select the requested "
-        "provider, appointment type, date, and time, then submit the booking. "
-        "The appointment form may be embedded inside an iframe. If it is, use "
-        "Stagehand's iframe-aware and visual interaction tools to continue; do "
-        "not stop only because the form is in an iframe. "
-        "Confirm the booking succeeded before finishing."
+        f"""Book a doctor's appointment on {website}.
+
+        Appointment details, including any required patient details:
+        {appointment_details}
+
+        Follow these rules:
+        1. Find and click the link or button to start booking the appointment. Look for text like "book", "make", "schedule", "request", and "appointment".
+        2. Fill relevant fields with exact values from appointment_details. Different websites ask questions in different orders. If the form is inside an iframe, use iframe-aware tools to fill it.
+        3. Use appointment_details as the only source of truth for every form value.
+        4. Do not invent, assume, or use placeholder information. Never enter fake values such as Jane Doe, 555-555-5555, test emails, made-up dates of birth, addresses, insurance IDs, or patient details.
+        5. If a required field is not present in appointment_details, stop immediately and return failure with a clear message naming the missing field.
+        6. After all required fields are filled, click the final visible button to submit, request, schedule, or book the appointment. Then wait for a confirmation page or confirmation message before finishing."""
     )
 
     async with _stagehand_client() as client:
@@ -330,7 +334,7 @@ async def book_appointment(
                 id=session_id,
                 execute_options={
                     "instruction": instruction,
-                    "max_steps": 25,
+                    "max_steps": 60,
                 },
                 agent_config={
                     "model": STAGEHAND_BOOKING_MODEL,
@@ -372,6 +376,7 @@ async def book_appointment(
                 chat_id,
                 f"Booking {'succeeded' if success else 'failed'}: {final_message if final_message else ''}",
             )
+
 
             return {
                 "success": success,
