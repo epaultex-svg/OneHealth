@@ -4,9 +4,11 @@ Tool nodes wrap a single call from `tools.py` and write its result to state.
 Model nodes call an LLM (via OpenRouter) and write structured output to state.
 """
 import os
-from typing import Literal
-from typing_extensions import TypedDict
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal, TypedDict
 
+import httpx
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openrouter import ChatOpenRouter
@@ -17,20 +19,16 @@ from supabase import create_client
 from state import (
     AppointmentDetails,
     ConfirmationDecision,
-    FirecrawlSearchQuery,
+    NexHealthOption,
+    NexHealthSlot,
     OneHealthAgentState,
+    PatientInfo,
     TextClassification,
     UserInfoExtracted,
-    WebsiteSelection,
 )
 from tools import (
-    book_appointment,
-    check_cookies_tool,
-    finish_browserbase_login,
-    firecrawl_search,
     read_message,
     send_message,
-    start_browserbase_login,
     store_info,
 )
 
@@ -93,6 +91,513 @@ def _resume_or_telegram_message(resume: object, state: OneHealthAgentState) -> d
     return _normalize_resume_message(resume, state) or read_message.invoke({})
 
 
+# ---------------------------------------------------------------------------
+# NexHealth helpers
+# ---------------------------------------------------------------------------
+
+NEXHEALTH_ACCEPT = "application/vnd.Nexhealth+json;version=2"
+
+
+class DateWindow(TypedDict):
+    start_date: str
+    days: int
+    specified: bool
+
+
+def _nexhealth_base_url() -> str:
+    return os.getenv("NEXHEALTH_API_BASE", "https://nexhealth.info").rstrip("/")
+
+
+def _nexhealth_subdomain() -> str:
+    subdomain = os.getenv("NEXHEALTH_SUBDOMAIN")
+    if not subdomain:
+        raise RuntimeError("Missing NEXHEALTH_SUBDOMAIN")
+    return subdomain
+
+
+def _nexhealth_api_version() -> str:
+    return os.getenv("NEXHEALTH_API_VERSION", "v20240412")
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _nexhealth_authenticate() -> dict[str, str]:
+    api_key = os.getenv("NEXHEALTH_API_KEY")
+    if not api_key:
+        raise RuntimeError("Missing NEXHEALTH_API_KEY")
+
+    response = httpx.post(
+        f"{_nexhealth_base_url()}/authenticates",
+        headers={
+            "Accept": NEXHEALTH_ACCEPT,
+            "Authorization": api_key,
+        },
+        timeout=30.0,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"NexHealth auth failed: {response.status_code} {response.text}")
+
+    payload = response.json()
+    token = (payload.get("data") or {}).get("token")
+    if not token:
+        raise RuntimeError(f"NexHealth auth response missing token: {payload}")
+
+    return {
+        "nexhealth_bearer_token": token,
+        "nexhealth_bearer_token_created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _ensure_nexhealth_token(state: OneHealthAgentState) -> tuple[str, dict[str, str]]:
+    token = state.get("nexhealth_bearer_token")
+    created_at = _parse_datetime(state.get("nexhealth_bearer_token_created_at"))
+    now = datetime.now(timezone.utc)
+
+    if token and created_at and now - created_at < timedelta(minutes=55):
+        return token, {}
+
+    update = _nexhealth_authenticate()
+    return update["nexhealth_bearer_token"], update
+
+
+def _nexhealth_request(
+    state: OneHealthAgentState,
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    token, token_update = _ensure_nexhealth_token(state)
+    merged_params = {"subdomain": _nexhealth_subdomain()}
+    if params:
+        merged_params.update(params)
+
+    headers = {
+        "Accept": NEXHEALTH_ACCEPT,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Nex-Api-Version": _nexhealth_api_version(),
+    }
+
+    response = httpx.request(
+        method,
+        f"{_nexhealth_base_url()}{path}",
+        params=merged_params,
+        json=json_body,
+        headers=headers,
+        timeout=30.0,
+    )
+
+    if response.status_code == 401:
+        token_update = _nexhealth_authenticate()
+        headers["Authorization"] = f"Bearer {token_update['nexhealth_bearer_token']}"
+        response = httpx.request(
+            method,
+            f"{_nexhealth_base_url()}{path}",
+            params=merged_params,
+            json=json_body,
+            headers=headers,
+            timeout=30.0,
+        )
+
+    if response.status_code >= 400:
+        try:
+            error_payload = response.json()
+        except ValueError:
+            error_payload = response.text
+        raise RuntimeError(f"NexHealth {method} {path} failed: {response.status_code} {error_payload}")
+
+    return response.json(), token_update
+
+
+def _payload_data(payload: dict[str, Any]) -> Any:
+    return payload.get("data", payload)
+
+
+def _extract_items(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    data = _payload_data(payload)
+    singular = key[:-1] if key.endswith("s") else key
+
+    if isinstance(data, dict):
+        value = data.get(key, data.get(singular))
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+        if isinstance(value, dict):
+            return [value]
+        return [data] if data.get("id") is not None else []
+
+    if isinstance(data, list):
+        items: list[dict[str, Any]] = []
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get(key, entry.get(singular))
+            if isinstance(value, list):
+                items.extend(item for item in value if isinstance(item, dict))
+            elif isinstance(value, dict):
+                items.append(value)
+            elif entry.get("id") is not None:
+                items.append(entry)
+        return items
+
+    return []
+
+
+def _record_id(record: dict[str, Any]) -> int | None:
+    value = record.get("id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _clean(value: object) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _is_missing(value: object) -> bool:
+    text = _clean(value).lower()
+    return not text or text in {"not specified", "unknown", "none", "n/a", "null"}
+
+
+def _record_label(record: dict[str, Any]) -> str:
+    bits = [
+        record.get("name"),
+        record.get("display_name"),
+        record.get("provider_name"),
+        record.get("first_name"),
+        record.get("last_name"),
+        record.get("address"),
+        record.get("city"),
+        record.get("state"),
+    ]
+    label = " ".join(_clean(bit) for bit in bits if _clean(bit))
+    return label or f"ID {record.get('id')}"
+
+
+def _record_search_text(record: dict[str, Any]) -> str:
+    nested = []
+    for value in record.values():
+        if isinstance(value, dict):
+            nested.extend(_clean(v) for v in value.values())
+    values = [_clean(value) for value in record.values() if not isinstance(value, (dict, list))]
+    return " ".join(values + nested).lower()
+
+
+def _match_record(records: list[dict[str, Any]], desired_text: str) -> dict[str, Any] | None:
+    desired = _clean(desired_text).lower()
+    if _is_missing(desired):
+        return None
+
+    desired_tokens = set(re.findall(r"[a-z0-9]+", desired))
+    best: tuple[int, dict[str, Any]] | None = None
+    for record in records:
+        haystack = _record_search_text(record)
+        if desired in haystack:
+            return record
+        score = len(desired_tokens.intersection(set(re.findall(r"[a-z0-9]+", haystack))))
+        if score and (best is None or score > best[0]):
+            best = (score, record)
+    return best[1] if best and best[0] >= 2 else None
+
+
+def _choice_prompt(prompt: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "prompt": prompt,
+        "options": [
+            {"index": index, "id": record.get("id"), "label": _record_label(record)}
+            for index, record in enumerate(records[:10], start=1)
+        ],
+    }
+
+
+def _choice_options(records: list[dict[str, Any]]) -> list[NexHealthOption]:
+    return [
+        {
+            "id": _record_id(record),
+            "label": _record_label(record),
+            "record": record,
+        }
+        for record in records[:10]
+    ]
+
+
+def _options_text(title: str, options: list[NexHealthOption]) -> str:
+    lines = [title]
+    lines.extend(
+        f"{index}. {option.get('label')} (ID {option.get('id')})"
+        for index, option in enumerate(options, start=1)
+    )
+    lines.append("Reply with the number you want.")
+    return "\n".join(lines)
+
+
+def _select_option_from_resume(
+    resume: object,
+    state: OneHealthAgentState,
+    options: list[NexHealthOption],
+) -> NexHealthOption | None:
+    text = _resume_text(resume, state)
+    if not text:
+        return None
+
+    match = re.search(r"\d+", text)
+    if match:
+        number = int(match.group())
+        if 1 <= number <= len(options):
+            return options[number - 1]
+        for option in options:
+            if option.get("id") == number:
+                return option
+
+    records = [option.get("record") for option in options if isinstance(option.get("record"), dict)]
+    selected_record = _match_record(records, text)
+    if not selected_record:
+        return None
+    selected_id = _record_id(selected_record)
+    return next((option for option in options if option.get("id") == selected_id), None)
+
+
+def _resume_text(resume: object, state: OneHealthAgentState) -> str:
+    message = _normalize_resume_message(resume, state)
+    if message:
+        return message.get("user_message_content", "")
+    if isinstance(resume, dict):
+        for key in ("choice", "selection", "id", "text", "message", "content"):
+            value = resume.get(key)
+            if value is not None:
+                return _clean(value)
+    return _clean(resume)
+
+
+def _select_record_from_resume(
+    resume: object,
+    state: OneHealthAgentState,
+    records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    text = _resume_text(resume, state)
+    if not text:
+        return None
+
+    match = re.search(r"\d+", text)
+    if match:
+        number = int(match.group())
+        if 1 <= number <= len(records[:10]):
+            return records[number - 1]
+        for record in records:
+            if _record_id(record) == number:
+                return record
+
+    return _match_record(records, text)
+
+
+def _extract_patient_info_from_text(text: str, current: PatientInfo | None = None) -> PatientInfo:
+    current = dict(current or {})
+    extractor = _model().with_structured_output(PatientInfo)
+    extracted: PatientInfo = extractor.invoke([
+        SystemMessage(content=(
+            "Extract patient demographics for NexHealth scheduling. "
+            "Return only fields present in the message. Supported fields: "
+            "first_name, last_name, date_of_birth as YYYY-MM-DD if available, "
+            "phone_number, email."
+        )),
+        HumanMessage(content=text),
+    ])
+
+    for key, value in extracted.items():
+        cleaned = _clean(value)
+        if cleaned:
+            current[key] = cleaned
+    return current
+
+
+def _patient_missing_fields(patient_info: PatientInfo | None) -> list[str]:
+    patient_info = patient_info or {}
+    missing = [
+        field for field in ("first_name", "last_name", "date_of_birth")
+        if _is_missing(patient_info.get(field))
+    ]
+    if _is_missing(patient_info.get("email")):
+        missing.append("email")
+    if _is_missing(patient_info.get("phone_number")):
+        missing.append("phone_number")
+    return missing
+
+
+def _collect_patient_info(state: OneHealthAgentState) -> PatientInfo:
+    patient_info = dict(state.get("patient_info") or {})
+    prompt = (
+        "Please provide the patient's first name, last name, date of birth "
+        "(YYYY-MM-DD), email, and phone number."
+    )
+
+    while _patient_missing_fields(patient_info):
+        resume = interrupt({
+            "chat_id": state.get("chat_id"),
+            "prompt": prompt,
+            "missing_fields": _patient_missing_fields(patient_info),
+        })
+        text = _resume_text(resume, state)
+        patient_info = _extract_patient_info_from_text(text, patient_info)
+        missing = _patient_missing_fields(patient_info)
+        prompt = f"Still need: {', '.join(missing)}."
+
+    return patient_info
+
+
+def _patient_search_name(patient_info: PatientInfo) -> str:
+    return " ".join(
+        part for part in [
+            _clean(patient_info.get("first_name")),
+            _clean(patient_info.get("last_name")),
+        ]
+        if part
+    )
+
+
+def _patient_matches(record: dict[str, Any], patient_info: PatientInfo) -> bool:
+    bio = record.get("bio") if isinstance(record.get("bio"), dict) else {}
+    record_name = _clean(record.get("name") or record.get("display_name")).lower()
+    expected_name = _patient_search_name(patient_info).lower()
+    dob_matches = _clean(bio.get("date_of_birth")) == _clean(patient_info.get("date_of_birth"))
+    phone = _clean(patient_info.get("phone_number"))
+    email = _clean(patient_info.get("email")).lower()
+    phone_matches = bool(phone and phone in _clean(bio.get("phone_number")))
+    email_matches = bool(email and email == _clean(record.get("email")).lower())
+    return expected_name in record_name and dob_matches and (phone_matches or email_matches)
+
+
+def _patient_payload(patient_info: PatientInfo, provider_id: int) -> dict[str, Any]:
+    patient: dict[str, Any] = {
+        "first_name": patient_info["first_name"],
+        "last_name": patient_info["last_name"],
+        "bio": {
+            "date_of_birth": patient_info["date_of_birth"],
+            "phone_number": patient_info["phone_number"],
+        },
+    }
+    if not _is_missing(patient_info.get("email")):
+        patient["email"] = patient_info["email"]
+
+    return {
+        "provider": {"provider_id": provider_id},
+        "patient": patient,
+        "return_existing_if_match": True,
+    }
+
+
+def _normalize_patient_record(record: dict[str, Any]) -> dict[str, Any]:
+    """NexHealth GET returns patient objects; POST /patients returns data.user."""
+    user = record.get("user")
+    return user if isinstance(user, dict) else record
+
+
+def _date_window_from_details(state: OneHealthAgentState) -> DateWindow:
+    date_text = _clean((state.get("appt_details") or {}).get("Date"))
+    today = datetime.now(timezone.utc).date().isoformat()
+    if _is_missing(date_text):
+        return {"start_date": today, "days": 14, "specified": False}
+
+    iso_match = re.search(r"\d{4}-\d{2}-\d{2}", date_text)
+    if iso_match:
+        return {"start_date": iso_match.group(0), "days": 1, "specified": True}
+
+    normalizer = _model().with_structured_output(DateWindow)
+    try:
+        window: DateWindow = normalizer.invoke([
+            SystemMessage(content=(
+                f"Today is {today}. Convert the appointment date request to "
+                "start_date as YYYY-MM-DD. If the user specified a specific "
+                "date or day, set days to 1 and specified to true. If not, "
+                "use today, days 14, specified false."
+            )),
+            HumanMessage(content=date_text),
+        ])
+        datetime.strptime(window["start_date"], "%Y-%m-%d")
+        return {
+            "start_date": window["start_date"],
+            "days": 1 if window.get("specified") else min(int(window.get("days", 14)), 14),
+            "specified": bool(window.get("specified")),
+        }
+    except Exception:
+        return {"start_date": today, "days": 14, "specified": False}
+
+
+def _flatten_slots(payload: dict[str, Any]) -> list[NexHealthSlot]:
+    data = _payload_data(payload)
+    raw_groups = data if isinstance(data, list) else [data]
+    slots: list[NexHealthSlot] = []
+
+    for group in raw_groups:
+        if not isinstance(group, dict):
+            continue
+        group_slots = group.get("slots")
+        if isinstance(group_slots, list):
+            for slot in group_slots:
+                if not isinstance(slot, dict):
+                    continue
+                merged = dict(slot)
+                merged.setdefault("location_id", group.get("lid") or group.get("location_id"))
+                merged.setdefault("provider_id", group.get("pid") or group.get("provider_id"))
+                merged.setdefault("operatory_id", group.get("operatory_id"))
+                if merged.get("time") or merged.get("start_time"):
+                    slots.append(merged)
+        elif group.get("time") or group.get("start_time"):
+            slots.append(group)
+
+    return sorted(slots, key=lambda slot: _clean(slot.get("time") or slot.get("start_time")))
+
+
+def _next_available_date(payload: dict[str, Any]) -> str | None:
+    def normalize(value: object) -> str | None:
+        text = _clean(value)
+        if not text:
+            return None
+        match = re.search(r"\d{4}-\d{2}-\d{2}", text)
+        return match.group(0) if match else text
+
+    def walk(value: object) -> str | None:
+        if isinstance(value, dict):
+            found = normalize(value.get("next_available_date"))
+            if found:
+                return found
+            for nested in value.values():
+                found = walk(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for item in value:
+                found = walk(item)
+                if found:
+                    return found
+        return None
+
+    return walk(payload)
+
+
+def _slot_time(slot: NexHealthSlot) -> str:
+    return _clean(slot.get("time") or slot.get("start_time"))
+
+
+def _slot_label(slot: NexHealthSlot, index: int) -> str:
+    time = _slot_time(slot)
+    provider = slot.get("provider_id")
+    operatory = slot.get("operatory_id")
+    return f"{index}. {time} (provider {provider}, operatory {operatory})"
+
+
 def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent", "__end__"]]:
     """Read latest Telegram message, register new users, route on location.
 
@@ -153,7 +658,7 @@ def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_lo
     )
 
 
-def request_user_location(state: OneHealthAgentState) -> Command[Literal["classify_intent"]]:
+def request_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"]]:
     """Prompt user for location, wait for reply, store or skip, then continue."""
     chat_id = state["chat_id"]
 
@@ -174,7 +679,13 @@ def request_user_location(state: OneHealthAgentState) -> Command[Literal["classi
         })
 
     send_message.invoke({"chat_id": chat_id, "text": "How can I help?"})
-    return Command(goto="classify_intent")
+    return Command(goto="onboard")
+
+def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent"]]:
+    """Asks user for all necessary information to create an appointment via Nexhealth. Stores all info in state, and uses store_info to store in Supabase info
+    unlikely to change."""
+    patient_info = _collect_patient_info(state)
+    return Command(update={"patient_info": patient_info}, goto="classify_intent")
 
 def classify_intent(
     state: OneHealthAgentState,
@@ -358,7 +869,7 @@ def send_user_confirmation(
 
 def interpret_user_confirmation(
     state: OneHealthAgentState,
-) -> Command[Literal["store_in_supabase", "appointment_website_search", "send_correction_query"]]:
+) -> Command[Literal["store_in_supabase", "start_nexhealth_scheduling", "send_correction_query"]]:
     """Wait for user reply, interpret as confirm/deny, route accordingly.
 
     Pauses on interrupt(), reads the latest Telegram
@@ -390,7 +901,7 @@ def interpret_user_confirmation(
     if decision["decision"] == "denied":
         next_node = "send_correction_query"
     elif intent == "appointment":
-        next_node = "appointment_website_search"
+        next_node = "start_nexhealth_scheduling"
     else:
         next_node = "store_in_supabase"
 
@@ -512,68 +1023,460 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
 
     return Command(goto=END)
 
-def appointment_website_search(
-    state: OneHealthAgentState,
-) -> Command[Literal["check_cookies", "correct_info"]]:
-    """Build a Firecrawl query from appt_details, search, pick best site, route on."""
-    appt_details = state["appt_details"]
-    chat_id = state["chat_id"]
-
-    query_system = (
-        "Build a concise web search query to find healthcare appointment "
-        "booking websites. Prioritize practice name, specialty, location, "
-        "and insurance when available. Focus on online booking portals.\n\n"
-        f"Appointment details:\n{appt_details}"
-    )
-    query_model = _model().with_structured_output(FirecrawlSearchQuery)
-    search_query: FirecrawlSearchQuery = query_model.invoke([
-        SystemMessage(content=query_system),
-        HumanMessage(content="Generate the search query."),
-    ])
-
-    query = search_query.get("query") if isinstance(search_query, dict) else None
-    if not query:
-        query = " ".join(str(v) for v in appt_details.values() if v and v != "not specified")
-
-    raw = firecrawl_search.invoke({"query": query})
-    candidates = [
-        {"title": r.title, "url": r.url, "description": r.description or ""}
-        for r in (raw.values() if raw else [])
-    ]
-
-    if not candidates:
-        send_message.invoke({
-            "chat_id": chat_id,
-            "text": "Couldn't find booking sites — try specifying a practice name.",
-        })
-        return Command(goto="correct_info")
-
-    select_system = (
-        "Pick the single best URL for online appointment booking given the "
-        "appointment details. Prefer official practice/hospital patient portals "
-        "over directories (Zocdoc, Healthgrades) unless no official site exists.\n\n"
-        f"Appointment details:\n{appt_details}\n\n"
-        f"Candidates:\n{candidates}"
-    )
-    selector = _model().with_structured_output(WebsiteSelection)
-    selection: WebsiteSelection = selector.invoke([
-        SystemMessage(content=select_system),
-        HumanMessage(content="Select the best booking URL."),
-    ])
-
-    selected_url = selection.get("url") if isinstance(selection, dict) else None
-    candidate_urls = {c["url"] for c in candidates}
-    if selected_url not in candidate_urls:
-        selected_url = candidates[0]["url"]
-
+def start_nexhealth_scheduling(state: OneHealthAgentState) -> Command[Literal["get_location"]]:
+    """Start confirmed NexHealth scheduling workflow."""
     send_message.invoke({
-        "chat_id": chat_id,
-        "text": f"Found booking site: {selected_url}",
+        "chat_id": state["chat_id"],
+        "text": "Searching NexHealth appointment options now.",
+    })
+    return Command(goto="get_location")
+
+
+def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", "__end__"]]:
+    """Retrieve and store selected NexHealth location ID."""
+    env_location_id = os.getenv("NEXHEALTH_LOCATION_ID")
+    if env_location_id:
+        return Command(update={"nexhealth_location_id": int(env_location_id)}, goto="get_provider")
+
+    payload, token_update = _nexhealth_request(
+        state,
+        "GET",
+        "/locations",
+        params={"inactive": False},
+    )
+    locations = _extract_items(payload, "locations")
+    if not locations:
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": "No NexHealth locations were available for this API key.",
+        })
+        return Command(update=token_update, goto=END)
+
+    selected = None
+    if len(locations) == 1:
+        selected = locations[0]
+    else:
+        appt_details = state.get("appt_details") or {}
+        selected = _match_record(locations, _clean(appt_details.get("Location")))
+
+    while selected is None:
+        resume = interrupt({
+            "chat_id": state.get("chat_id"),
+            **_choice_prompt("Choose a NexHealth location.", locations),
+        })
+        selected = _select_record_from_resume(resume, state, locations)
+
+    location_id = _record_id(selected)
+    if location_id is None:
+        raise RuntimeError(f"Selected NexHealth location missing id: {selected}")
+
+    return Command(
+        update={**token_update, "nexhealth_location_id": location_id},
+        goto="get_provider",
+    )
+
+
+def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_options", "get_patient", "__end__"]]:
+    """Retrieve and store selected NexHealth provider ID."""
+    location_id = state.get("nexhealth_location_id")
+    if location_id is None:
+        raise RuntimeError("Cannot fetch NexHealth providers without nexhealth_location_id")
+
+    payload, token_update = _nexhealth_request(
+        state,
+        "GET",
+        "/providers",
+        params={
+            "location_id": location_id,
+            "requestable": True,
+            "inactive": False,
+            "per_page": 100,
+        },
+    )
+    providers = _extract_items(payload, "providers")
+    if not providers:
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": "No bookable NexHealth providers were found for that location.",
+        })
+        return Command(update=token_update, goto=END)
+
+    selected = None
+    if len(providers) == 1:
+        selected = providers[0]
+    else:
+        appt_details = state.get("appt_details") or {}
+        desired = " ".join([
+            state.get("user_message_content", ""),
+            _clean(appt_details.get("Practice")),
+            _clean(appt_details.get("Specialty")),
+            _clean(appt_details.get("Reason")),
+        ])
+        selected = _match_record(providers, desired)
+
+    if selected is None:
+        options = _choice_options(providers)
+        return Command(
+            update={**token_update, "nexhealth_provider_options": options},
+            goto="send_provider_options",
+        )
+
+    provider_id = _record_id(selected)
+    if provider_id is None:
+        raise RuntimeError(f"Selected NexHealth provider missing id: {selected}")
+
+    return Command(
+        update={**token_update, "nexhealth_provider_id": provider_id},
+        goto="get_patient",
+    )
+
+
+def send_provider_options(state: OneHealthAgentState) -> Command[Literal["select_provider"]]:
+    """Send provider options to Telegram before pausing for selection."""
+    options = state.get("nexhealth_provider_options") or []
+    if not options:
+        raise RuntimeError("Cannot send provider options without nexhealth_provider_options")
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": _options_text("Choose a provider.", options),
+    })
+    return Command(goto="select_provider")
+
+
+def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"]]:
+    """Pause for provider selection and store provider ID."""
+    options = state.get("nexhealth_provider_options") or []
+    if not options:
+        raise RuntimeError("Cannot select provider without nexhealth_provider_options")
+
+    selected = None
+    prompt = "Which provider number do you want?"
+    while selected is None:
+        resume = interrupt({
+            "chat_id": state.get("chat_id"),
+            "prompt": prompt,
+            "options": [
+                {"index": index, "id": option.get("id"), "label": option.get("label")}
+                for index, option in enumerate(options, start=1)
+            ],
+        })
+        selected = _select_option_from_resume(resume, state, options)
+        prompt = "Please reply with one of the listed provider numbers."
+
+    provider_id = selected.get("id")
+    if provider_id is None:
+        raise RuntimeError(f"Selected NexHealth provider option missing id: {selected}")
+
+    return Command(update={"nexhealth_provider_id": provider_id}, goto="get_patient")
+
+
+def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_type"]]:
+    """Retrieve existing NexHealth patient or create one, then store patient ID."""
+    if state.get("nexhealth_patient_id"):
+        return Command(goto="get_appointment_type")
+
+    location_id = state.get("nexhealth_location_id")
+    provider_id = state.get("nexhealth_provider_id")
+    if location_id is None or provider_id is None:
+        raise RuntimeError("Cannot get NexHealth patient without location and provider IDs")
+
+    patient_info = _collect_patient_info(state)
+    search_params: dict[str, Any] = {
+        "location_id": location_id,
+        "new_patient": False,
+        "include_upcoming_appts": False,
+        "location_strict": False,
+        "per_page": 5,
+        "name": _patient_search_name(patient_info),
+        "date_of_birth": patient_info["date_of_birth"],
+    }
+    if not _is_missing(patient_info.get("phone_number")):
+        search_params["phone_number"] = patient_info["phone_number"]
+    if not _is_missing(patient_info.get("email")):
+        search_params["email"] = patient_info["email"]
+
+    payload, token_update = _nexhealth_request(
+        state,
+        "GET",
+        "/patients",
+        params=search_params,
+    )
+    patients = _extract_items(payload, "patients")
+    selected = next((patient for patient in patients if _patient_matches(patient, patient_info)), None)
+    if selected is None and patients:
+        selected = patients[0]
+
+    if selected is None:
+        payload, created_token_update = _nexhealth_request(
+            {**state, **token_update},
+            "POST",
+            "/patients",
+            params={"location_id": location_id},
+            json_body=_patient_payload(patient_info, provider_id),
+        )
+        token_update.update(created_token_update)
+        created_patients = _extract_items(payload, "patients")
+        selected = created_patients[0] if created_patients else _payload_data(payload)
+
+    if not isinstance(selected, dict):
+        raise RuntimeError(f"NexHealth patient response missing patient object: {selected}")
+
+    selected = _normalize_patient_record(selected)
+    patient_id = _record_id(selected)
+    if patient_id is None:
+        raise RuntimeError(f"NexHealth patient response missing id: {selected}")
+
+    return Command(
+        update={
+            **token_update,
+            "patient_info": patient_info,
+            "nexhealth_patient_id": patient_id,
+        },
+        goto="get_appointment_type",
+    )
+
+
+def get_appointment_type(state: OneHealthAgentState) -> Command[Literal["send_appointment_type_options", "get_appointment_slots", "__end__"]]:
+    """Retrieve and store selected NexHealth appointment type ID."""
+    location_id = state.get("nexhealth_location_id")
+    if location_id is None:
+        raise RuntimeError("Cannot fetch appointment types without nexhealth_location_id")
+
+    payload, token_update = _nexhealth_request(
+        state,
+        "GET",
+        "/appointment_types",
+        params={"location_id": location_id},
+    )
+    appointment_types = _extract_items(payload, "appointment_types")
+    if not appointment_types:
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": "No NexHealth appointment types were available for that location.",
+        })
+        return Command(update=token_update, goto=END)
+
+    selected = None
+    if len(appointment_types) == 1:
+        selected = appointment_types[0]
+    else:
+        appt_details = state.get("appt_details") or {}
+        desired = " ".join([
+            _clean(appt_details.get("Reason")),
+            _clean(appt_details.get("Specialty")),
+            state.get("user_message_content", ""),
+        ])
+        selected = _match_record(appointment_types, desired)
+
+    if selected is None:
+        options = _choice_options(appointment_types)
+        return Command(
+            update={**token_update, "nexhealth_appointment_type_options": options},
+            goto="send_appointment_type_options",
+        )
+
+    appointment_type_id = _record_id(selected)
+    if appointment_type_id is None:
+        raise RuntimeError(f"Selected NexHealth appointment type missing id: {selected}")
+
+    return Command(
+        update={**token_update, "nexhealth_appointment_type_id": appointment_type_id},
+        goto="get_appointment_slots",
+    )
+
+
+def send_appointment_type_options(state: OneHealthAgentState) -> Command[Literal["select_appointment_type"]]:
+    """Send appointment type options to Telegram before pausing for selection."""
+    options = state.get("nexhealth_appointment_type_options") or []
+    if not options:
+        raise RuntimeError("Cannot send appointment type options without nexhealth_appointment_type_options")
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": _options_text("Choose an appointment type.", options),
+    })
+    return Command(goto="select_appointment_type")
+
+
+def select_appointment_type(state: OneHealthAgentState) -> Command[Literal["get_appointment_slots"]]:
+    """Pause for appointment type selection and store appointment type ID."""
+    options = state.get("nexhealth_appointment_type_options") or []
+    if not options:
+        raise RuntimeError("Cannot select appointment type without nexhealth_appointment_type_options")
+
+    selected = None
+    prompt = "Which appointment type number do you want?"
+    while selected is None:
+        resume = interrupt({
+            "chat_id": state.get("chat_id"),
+            "prompt": prompt,
+            "options": [
+                {"index": index, "id": option.get("id"), "label": option.get("label")}
+                for index, option in enumerate(options, start=1)
+            ],
+        })
+        selected = _select_option_from_resume(resume, state, options)
+        prompt = "Please reply with one of the listed appointment type numbers."
+
+    appointment_type_id = selected.get("id")
+    if appointment_type_id is None:
+        raise RuntimeError(f"Selected NexHealth appointment type option missing id: {selected}")
+
+    return Command(update={"nexhealth_appointment_type_id": appointment_type_id}, goto="get_appointment_slots")
+
+
+def get_appointment_slots(state: OneHealthAgentState) -> Command[Literal["send_slot_options", "__end__"]]:
+    """Retrieve available slots via NexHealth /available_slots."""
+    location_id = state.get("nexhealth_location_id")
+    provider_id = state.get("nexhealth_provider_id")
+    appointment_type_id = state.get("nexhealth_appointment_type_id")
+    if location_id is None or provider_id is None or appointment_type_id is None:
+        raise RuntimeError("Cannot fetch slots without location, provider, and appointment type IDs")
+
+    window = _date_window_from_details(state)
+    token_update: dict[str, Any] = {}
+    request_state: OneHealthAgentState = state
+    start_date = window["start_date"]
+    days = window["days"]
+    searched_dates: set[str] = set()
+    slots: list[NexHealthSlot] = []
+
+    for _ in range(5):
+        searched_dates.add(start_date)
+        payload, request_token_update = _nexhealth_request(
+            request_state,
+            "GET",
+            "/available_slots",
+            params={
+                "start_date": start_date,
+                "days": days,
+                "lids[]": [location_id],
+                "pids[]": [provider_id],
+                "appointment_type_id": appointment_type_id,
+            },
+        )
+        token_update.update(request_token_update)
+        request_state = {**state, **token_update}
+        slots = _flatten_slots(payload)[:5]
+        if slots:
+            break
+
+        next_date = _next_available_date(payload)
+        if not next_date or next_date in searched_dates:
+            break
+
+        start_date = next_date
+        days = 1
+
+    if not slots:
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": "No NexHealth appointment slots were available for that search.",
+        })
+        return Command(update=token_update, goto=END)
+
+    return Command(
+        update={**token_update, "nexhealth_available_slots": slots},
+        goto="send_slot_options",
+    )
+
+
+def send_slot_options(state: OneHealthAgentState) -> Command[Literal["select_appointment_slot"]]:
+    """Send top slot options once before pausing for selection."""
+    slots = state.get("nexhealth_available_slots") or []
+    lines = ["Available appointment slots:"]
+    lines.extend(_slot_label(slot, index) for index, slot in enumerate(slots, start=1))
+    lines.append("Reply with the number you want.")
+    send_message.invoke({"chat_id": state["chat_id"], "text": "\n".join(lines)})
+    return Command(goto="select_appointment_slot")
+
+
+def select_appointment_slot(state: OneHealthAgentState) -> Command[Literal["book_appointment"]]:
+    """Pause for user slot selection and store chosen slot."""
+    slots = state.get("nexhealth_available_slots") or []
+    if not slots:
+        raise RuntimeError("Cannot select appointment slot without available slots")
+
+    selected: NexHealthSlot | None = None
+    prompt = "Which appointment slot number do you want?"
+    while selected is None:
+        resume = interrupt({
+            "chat_id": state.get("chat_id"),
+            "prompt": prompt,
+            "options": [
+                {"index": index, "label": _slot_label(slot, index)}
+                for index, slot in enumerate(slots, start=1)
+            ],
+        })
+        text = _resume_text(resume, state)
+        match = re.search(r"\d+", text)
+        if match:
+            index = int(match.group())
+            if 1 <= index <= len(slots):
+                selected = slots[index - 1]
+        prompt = "Please reply with one of the listed slot numbers."
+
+    return Command(update={"nexhealth_selected_slot": selected}, goto="book_appointment")
+
+
+def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """Book user's appointment using NexHealth API and confirmed details."""
+    location_id = state.get("nexhealth_location_id")
+    provider_id = state.get("nexhealth_provider_id")
+    patient_id = state.get("nexhealth_patient_id")
+    appointment_type_id = state.get("nexhealth_appointment_type_id")
+    slot = state.get("nexhealth_selected_slot") or {}
+    start_time = _slot_time(slot)
+    operatory_id = slot.get("operatory_id")
+
+    if None in (location_id, provider_id, patient_id, appointment_type_id) or not start_time or operatory_id is None:
+        raise RuntimeError("Cannot book NexHealth appointment without patient/provider/type/slot details")
+
+    appt_payload = {
+        "appt": {
+            "patient_id": patient_id,
+            "provider_id": slot.get("provider_id") or provider_id,
+            "operatory_id": operatory_id,
+            "start_time": start_time,
+            "appointment_type_id": appointment_type_id,
+        }
+    }
+    payload, token_update = _nexhealth_request(
+        state,
+        "POST",
+        "/appointments",
+        params={
+            "location_id": location_id,
+            "notify_patient": False,
+        },
+        json_body=appt_payload,
+    )
+
+    result = _payload_data(payload)
+    appointment_record = result.get("appointment") if isinstance(result, dict) else result
+    persisted_details = {
+        "appointment": appointment_record,
+        "appointment_details": state.get("appt_details") or {},
+        "patient_id": patient_id,
+        "provider_id": provider_id,
+        "location_id": location_id,
+        "appointment_type_id": appointment_type_id,
+        "slot": slot,
+    }
+    store_info.invoke({
+        "chat_id": state["chat_id"],
+        "website": "nexhealth",
+        "appt_details": persisted_details,
+    })
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": f"Booked your appointment for {start_time}.",
     })
 
     return Command(
-        update={"appt_website": selected_url},
-        goto="check_cookies",
+        update={
+            **token_update,
+            "book_appointment_result": payload,
+            "nexhealth_appointment_result": payload,
+        },
+        goto=END,
     )
-
-

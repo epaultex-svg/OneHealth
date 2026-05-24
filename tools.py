@@ -129,17 +129,6 @@ def firecrawl_search(query: str) -> dict:
 
 
 
-
-@tool
-async def book_appointment(
-    website: str,
-    chat_id: str,
-    context_id: str,
-    appointment_details: dict,
-) -> dict:
-    pass
-
-
 @tool
 def store_info(
     chat_id: str,

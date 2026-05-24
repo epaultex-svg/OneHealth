@@ -22,7 +22,6 @@ Defined in `@tools.py`:
 | `read_message()` | Reads latest inbound user messages from Telegram |
 | `send_message()` | Sends outbound messages to user via Telegram (optional Mini App keyboard) |
 | `firecrawl_search()` | Searches relevant websites using Firecrawl MCP for healthcare appointments |
-| `check_cookies_tool()` | Looks up saved Browserbase **context_id** for a website in Supabase |
 | `book_appointment()` | Books via Stagehand using persisted Browserbase context (cookies) |
 | `store_info()` | Stores user preferences in Supabase |
 
@@ -41,20 +40,18 @@ Defined in `@state.py`:
 | `username` | str | User identifier | No |
 | `message_classification` | TextClassification | Intent classification (appointment/user_info) | Yes — cannot recalculate |
 | `appt_website` | str | Selected healthcare booking website URL from Firecrawl search | No |
-| `browserbase_context_id` | str \| None | Persisted Browserbase context (auth cookies) | Yes for booking |
-| `browserbase_session_id` | str \| None | Active login session (live view only) | No |
 | `appt_details` | dict | Appointment fields for booking | No |
 
 ## Nodes
 
-Full workflow graph: https://excalidraw.com/#json=hZ8WnN3h215wmn9HTe4k6,XuY3QWH6hPYToWLgZyoNlg
+Full workflow graph: https://excalidraw.com/#json=DJBxt8S5xtPR9VxsOG3gh,0kejb2Bg1pmEECxcAQPBhA
 
 Each box in the diagram (excluding "State" and "Notes/Architecture decisions") represents a node in the LangGraph agent.
 
 ## External APIs & Services
 
 - **Firecrawl MCP**: Web scraping and search
-- **BrowserBase API**: Healthcare appointment booking (Stagehand) and Cookie checking (Browserbase contexts)
+- **Nexhealth API**: Appointment scheduling
 - **Supabase**: User preference persistence
 - **Telegram Bot API**: User messaging
 
