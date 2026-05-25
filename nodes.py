@@ -32,6 +32,32 @@ from appointments import (
     mark_appointment_failed,
     reserve_appointment_booking,
 )
+from conversation import (
+    appointment_confirmation_text,
+    booking_duplicate_text,
+    booking_success_text,
+    cancelled_text,
+    choice_keyboard,
+    choice_text,
+    confirmation_keyboard,
+    correction_prompt_text,
+    invalid_choice_text,
+    is_cancel_text,
+    location_added_text,
+    location_request_text,
+    location_skipped_text,
+    no_appointment_types_text,
+    no_locations_text,
+    no_providers_text,
+    no_slots_text,
+    onboarding_ready_text,
+    patient_info_prompt,
+    patient_privacy_text,
+    patient_retry_text,
+    profile_confirmation_text,
+    saved_text,
+    scheduling_loading_text,
+)
 from tools import (
     read_message,
     send_message,
@@ -396,13 +422,11 @@ def _choice_options(
 
 
 def _options_text(title: str, options: list[NexHealthOption]) -> str:
-    lines = [title]
-    lines.extend(
-        f"{index}. {option.get('label')}"
-        for index, option in enumerate(options, start=1)
-    )
-    lines.append("Reply with the number you want.")
-    return "\n".join(lines)
+    return choice_text(title, [_clean(option.get("label")) for option in options])
+
+
+def _options_keyboard(options: list[NexHealthOption]) -> list[list[str]]:
+    return choice_keyboard([_clean(option.get("label")) for option in options])
 
 
 def _select_option_from_resume(
@@ -497,23 +521,30 @@ def _patient_missing_fields(patient_info: PatientInfo | None) -> list[str]:
     return missing
 
 
-def _collect_patient_info(state: OneHealthAgentState) -> PatientInfo:
+def _collect_patient_info(state: OneHealthAgentState) -> PatientInfo | None:
     patient_info = dict(state.get("patient_info") or {})
-    prompt = (
-        "Please provide the patient's first name, last name, date of birth "
-        "(YYYY-MM-DD), email, and phone number."
-    )
+    chat_id = state.get("chat_id")
+    missing = _patient_missing_fields(patient_info)
+    if missing and chat_id:
+        send_message.invoke({"chat_id": chat_id, "text": patient_privacy_text()})
+    prompt = patient_info_prompt(missing)
 
-    while _patient_missing_fields(patient_info):
+    while missing:
         resume = interrupt({
             "chat_id": state.get("chat_id"),
             "prompt": prompt,
-            "missing_fields": _patient_missing_fields(patient_info),
+            "missing_fields": missing,
         })
         text = _resume_text(resume, state)
+        if is_cancel_text(text):
+            if chat_id:
+                send_message.invoke({"chat_id": chat_id, "text": cancelled_text(), "remove_keyboard": True})
+            return None
         patient_info = _extract_patient_info_from_text(text, patient_info)
         missing = _patient_missing_fields(patient_info)
-        prompt = f"Still need: {', '.join(missing)}."
+        if missing and chat_id:
+            send_message.invoke({"chat_id": chat_id, "text": patient_retry_text(missing)})
+        prompt = patient_retry_text(missing)
 
     return patient_info
 
@@ -768,7 +799,7 @@ def request_user_location(state: OneHealthAgentState) -> Command[Literal["await_
 
     send_message.invoke({
         "chat_id": chat_id,
-        "text": "Please share your location for best results.",
+        "text": location_request_text(),
         "request_location": True,
     })
     return Command(goto="await_user_location")
@@ -781,7 +812,7 @@ def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"
 
     resume = interrupt({
         "chat_id": chat_id,
-        "prompt": "Please share your location for best results.",
+        "prompt": location_request_text(),
     })
     reply = _normalize_resume_message(resume, state) or _resume_or_telegram_message(resume, state)
 
@@ -792,13 +823,13 @@ def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"
     else:
         send_message.invoke({
             "chat_id": chat_id,
-            "text": "No worries... you can change this later using /add_location",
+            "text": location_skipped_text(),
         })
 
     reply_update_id = reply.get("update_id") if isinstance(reply, dict) else state.get("update_id")
 
     if reason == "add_location":
-        message_content = "Location added." if location else "Location not added."
+        message_content = location_added_text(bool(location))
         send_message.invoke({
             "chat_id": chat_id,
             "text": message_content,
@@ -816,7 +847,7 @@ def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"
 
     send_message.invoke({
         "chat_id": chat_id,
-        "text": "How can I help?",
+        "text": onboarding_ready_text(),
         "remove_keyboard": True,
     })
     return Command(
@@ -828,10 +859,12 @@ def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"
         goto="onboard",
     )
 
-def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent"]]:
+def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent", "__end__"]]:
     """Asks user for all necessary information to create an appointment via Nexhealth. Stores all info in state, and uses store_info to store in Supabase info
     unlikely to change."""
     patient_info = _collect_patient_info(state)
+    if patient_info is None:
+        return Command(update={"conversation_status": "cancelled"}, goto=END)
     store_info.invoke({
         "chat_id": state["chat_id"],
         "patient_info": patient_info,
@@ -925,16 +958,7 @@ def draft_appointment_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
-    draft = (
-        "Just confirming your appointment details...\n"
-        f"- Date: {details.get('Date', 'not specified')}\n"
-        f"- Specialty: {details.get('Specialty', 'not specified')}\n"
-        f"- Practice: {details.get('Practice', 'not specified')}\n"
-        f"- Reason: {details.get('Reason', 'not specified')}\n"
-        f"- Insurance: {details.get('Insurance', 'not specified')}\n"
-        f"- Location: {details.get('Location', 'not specified')}\n"
-        "Does this look right?"
-    )
+    draft = appointment_confirmation_text(details)
 
     return Command(
         update={"appt_draft": draft, "appt_details": details},
@@ -953,26 +977,6 @@ def draft_user_info_storage_details(
     """
     user_message_content = state["user_message_content"]
 
-    system = (
-        "You are a profile-storage assistant. Read the user's message and "
-        "extract only the fields they explicitly want stored. Supported "
-        "fields:\n"
-        "- location: where they live or want appointments near\n"
-        "- insurance: their insurance provider / plan\n"
-        "- username: a nickname they want the bot to call them\n\n"
-        "Include a bullet ONLY for fields the user mentioned. Do not invent "
-        "values. Do not include unsupported fields.\n\n"
-        "Respond with ONLY the confirmation text, exactly in this format:\n"
-        "I'll store this info. Does this look right?\n"
-        "- <item>: <value>\n"
-        "(repeat the bullet line for each mentioned field)"
-    )
-
-    draft: str = _model().invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=user_message_content),
-    ]).content
-
     extract_system = (
         "Extract profile fields the user explicitly asked to store. "
         "Supported fields:\n"
@@ -987,6 +991,7 @@ def draft_user_info_storage_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
+    draft = profile_confirmation_text(extracted)
 
     return Command(
         update={
@@ -1010,13 +1015,13 @@ def send_user_confirmation(
 
     draft = state["appt_draft"] if intent == "appointment" else state["user_info_draft"]
 
-    send_message.invoke({"chat_id": chat_id, "text": draft})
+    send_message.invoke({"chat_id": chat_id, "text": draft, "keyboard": confirmation_keyboard()})
 
     return Command(goto="interpret_user_confirmation")
 
 def interpret_user_confirmation(
     state: OneHealthAgentState,
-) -> Command[Literal["store_in_supabase", "start_nexhealth_scheduling", "send_correction_query"]]:
+) -> Command[Literal["store_in_supabase", "start_nexhealth_scheduling", "send_correction_query", "__end__"]]:
     """Wait for user reply, interpret as confirm/deny, route accordingly.
 
     Pauses on interrupt(), reads the latest Telegram
@@ -1032,6 +1037,16 @@ def interpret_user_confirmation(
 
     reply = _resume_or_telegram_message(resume, state)
     reply_text = reply["user_message_content"]
+    if is_cancel_text(reply_text):
+        send_message.invoke({"chat_id": chat_id, "text": cancelled_text(), "remove_keyboard": True})
+        return Command(
+            update={
+                "user_message_content": reply_text,
+                "update_id": reply["update_id"],
+                "conversation_status": "cancelled",
+            },
+            goto=END,
+        )
 
     system = (
         "Classify the user's reply to a confirmation prompt into exactly one decision:\n"
@@ -1065,12 +1080,12 @@ def send_correction_query(
 ) -> Command[Literal["correct_info"]]:
     """Ask user what to fix after they reject confirmation draft."""
     chat_id = state["chat_id"]
-    send_message.invoke({"chat_id": chat_id, "text": "What did I miss?"})
+    send_message.invoke({"chat_id": chat_id, "text": correction_prompt_text()})
     return Command(goto="correct_info")
 
 def correct_info(
     state: OneHealthAgentState,
-) -> Command[Literal["send_user_confirmation"]]:
+) -> Command[Literal["send_user_confirmation", "__end__"]]:
     """Wait for user correction, revise draft, route back to confirmation."""
     chat_id = state["chat_id"]
     intent = state["user_message_classification"]["intent"]
@@ -1079,6 +1094,16 @@ def correct_info(
 
     msg = _resume_or_telegram_message(resume, state)
     correction_text = msg["user_message_content"]
+    if is_cancel_text(correction_text):
+        send_message.invoke({"chat_id": chat_id, "text": cancelled_text(), "remove_keyboard": True})
+        return Command(
+            update={
+                "user_message_content": correction_text,
+                "update_id": msg["update_id"],
+                "conversation_status": "cancelled",
+            },
+            goto=END,
+        )
 
     if intent == "appointment":
         current_draft = state["appt_draft"]
@@ -1166,7 +1191,7 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
         payload["insurance"] = extracted["insurance"]
 
     store_info.invoke(payload)
-    send_message.invoke({"chat_id": chat_id, "text": "Saved."})
+    send_message.invoke({"chat_id": chat_id, "text": saved_text(), "remove_keyboard": True})
 
     return Command(goto=END)
 
@@ -1174,7 +1199,8 @@ def start_nexhealth_scheduling(state: OneHealthAgentState) -> Command[Literal["g
     """Start confirmed NexHealth scheduling workflow."""
     send_message.invoke({
         "chat_id": state["chat_id"],
-        "text": "Searching NexHealth appointment options now.",
+        "text": scheduling_loading_text(),
+        "remove_keyboard": True,
     })
     return Command(goto="get_location")
 
@@ -1195,7 +1221,7 @@ def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", 
     if not locations:
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": "No NexHealth locations were available for this API key.",
+            "text": no_locations_text(),
         })
         return Command(update=token_update, goto=END)
 
@@ -1207,11 +1233,22 @@ def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", 
         selected = _match_record(locations, _clean(appt_details.get("Location")))
 
     while selected is None:
+        location_options = _choice_options(locations)
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": _options_text("Choose a location.", location_options),
+            "keyboard": _options_keyboard(location_options),
+        })
         resume = interrupt({
             "chat_id": state.get("chat_id"),
             **_choice_prompt("Choose a NexHealth location.", locations),
         })
+        if is_cancel_text(_resume_text(resume, state)):
+            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
+            return Command(update={**token_update, "conversation_status": "cancelled"}, goto=END)
         selected = _select_record_from_resume(resume, state, locations)
+        if selected is None:
+            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("location")})
 
     location_id = _record_id(selected)
     if location_id is None:
@@ -1244,7 +1281,7 @@ def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_o
     if not providers:
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": "No bookable NexHealth providers were found for that location.",
+            "text": no_providers_text(),
         })
         return Command(update=token_update, goto=END)
 
@@ -1286,11 +1323,12 @@ def send_provider_options(state: OneHealthAgentState) -> Command[Literal["select
     send_message.invoke({
         "chat_id": state["chat_id"],
         "text": _options_text("Choose a provider.", options),
+        "keyboard": _options_keyboard(options),
     })
     return Command(goto="select_provider")
 
 
-def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"]]:
+def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient", "__end__"]]:
     """Pause for provider selection and store provider ID."""
     options = state.get("nexhealth_provider_options") or []
     if not options:
@@ -1307,8 +1345,14 @@ def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"
                 for index, option in enumerate(options, start=1)
             ],
         })
+        text = _resume_text(resume, state)
+        if is_cancel_text(text):
+            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
+            return Command(update={"conversation_status": "cancelled"}, goto=END)
         selected = _select_option_from_resume(resume, state, options)
         prompt = "Please reply with one of the listed provider numbers."
+        if selected is None:
+            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("provider")})
 
     provider_id = selected.get("id")
     if provider_id is None:
@@ -1317,7 +1361,7 @@ def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"
     return Command(update={"nexhealth_provider_id": provider_id}, goto="get_patient")
 
 
-def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_type"]]:
+def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_type", "__end__"]]:
     """Retrieve existing NexHealth patient or create one, then store patient ID."""
     location_id = state.get("nexhealth_location_id")
     provider_id = state.get("nexhealth_provider_id")
@@ -1344,6 +1388,8 @@ def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_
         stored_patient_info,
     )
     patient_info = _collect_patient_info({**state, "patient_info": patient_info})
+    if patient_info is None:
+        return Command(update={"conversation_status": "cancelled"}, goto=END)
     cached_patient_id = (
         _coerce_int(state.get("nexhealth_patient_id"))
         or _coerce_int(user_row.get("nexhealth_patient_id"))
@@ -1441,7 +1487,7 @@ def get_appointment_type(state: OneHealthAgentState) -> Command[Literal["send_ap
     if not appointment_types:
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": "No NexHealth appointment types were available for that location.",
+            "text": no_appointment_types_text(),
         })
         return Command(update=token_update, goto=END)
 
@@ -1482,11 +1528,12 @@ def send_appointment_type_options(state: OneHealthAgentState) -> Command[Literal
     send_message.invoke({
         "chat_id": state["chat_id"],
         "text": _options_text("Choose an appointment type.", options),
+        "keyboard": _options_keyboard(options),
     })
     return Command(goto="select_appointment_type")
 
 
-def select_appointment_type(state: OneHealthAgentState) -> Command[Literal["get_appointment_slots"]]:
+def select_appointment_type(state: OneHealthAgentState) -> Command[Literal["get_appointment_slots", "__end__"]]:
     """Pause for appointment type selection and store appointment type ID."""
     options = state.get("nexhealth_appointment_type_options") or []
     if not options:
@@ -1503,8 +1550,14 @@ def select_appointment_type(state: OneHealthAgentState) -> Command[Literal["get_
                 for index, option in enumerate(options, start=1)
             ],
         })
+        text = _resume_text(resume, state)
+        if is_cancel_text(text):
+            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
+            return Command(update={"conversation_status": "cancelled"}, goto=END)
         selected = _select_option_from_resume(resume, state, options)
         prompt = "Please reply with one of the listed appointment type numbers."
+        if selected is None:
+            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("appointment type")})
 
     appointment_type_id = selected.get("id")
     if appointment_type_id is None:
@@ -1559,7 +1612,7 @@ def get_appointment_slots(state: OneHealthAgentState) -> Command[Literal["send_s
     if not slots:
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": "No NexHealth appointment slots were available for that search.",
+            "text": no_slots_text(),
         })
         return Command(update=token_update, goto=END)
 
@@ -1572,14 +1625,16 @@ def get_appointment_slots(state: OneHealthAgentState) -> Command[Literal["send_s
 def send_slot_options(state: OneHealthAgentState) -> Command[Literal["select_appointment_slot"]]:
     """Send top slot options once before pausing for selection."""
     slots = state.get("nexhealth_available_slots") or []
-    lines = ["Available appointment slots:"]
-    lines.extend(_slot_label(slot, index) for index, slot in enumerate(slots, start=1))
-    lines.append("Reply with the number you want.")
-    send_message.invoke({"chat_id": state["chat_id"], "text": "\n".join(lines)})
+    labels = [_slot_label(slot, index).split(". ", 1)[1] for index, slot in enumerate(slots, start=1)]
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": choice_text("Available appointment slots:", labels),
+        "keyboard": choice_keyboard(labels),
+    })
     return Command(goto="select_appointment_slot")
 
 
-def select_appointment_slot(state: OneHealthAgentState) -> Command[Literal["book_appointment"]]:
+def select_appointment_slot(state: OneHealthAgentState) -> Command[Literal["book_appointment", "__end__"]]:
     """Pause for user slot selection and store chosen slot."""
     slots = state.get("nexhealth_available_slots") or []
     if not slots:
@@ -1597,12 +1652,17 @@ def select_appointment_slot(state: OneHealthAgentState) -> Command[Literal["book
             ],
         })
         text = _resume_text(resume, state)
+        if is_cancel_text(text):
+            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
+            return Command(update={"conversation_status": "cancelled"}, goto=END)
         match = re.search(r"\d+", text)
         if match:
             index = int(match.group())
             if 1 <= index <= len(slots):
                 selected = slots[index - 1]
         prompt = "Please reply with one of the listed slot numbers."
+        if selected is None:
+            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("slot")})
 
     return Command(update={"nexhealth_selected_slot": selected}, goto="book_appointment")
 
@@ -1655,12 +1715,11 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     )
     if not reservation.get("should_book"):
         status = reservation.get("status")
-        text = (
-            f"Booked your appointment for {readable_start_time}."
-            if status == "booked"
-            else "That appointment is already being processed, so I won't create a duplicate booking."
-        )
-        send_message.invoke({"chat_id": chat_id, "text": text})
+        send_message.invoke({
+            "chat_id": chat_id,
+            "text": booking_duplicate_text(readable_start_time, status),
+            "remove_keyboard": True,
+        })
         return Command(
             update={
                 "appointment_booking_key": booking_key,
@@ -1698,7 +1757,8 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     )
     send_message.invoke({
         "chat_id": chat_id,
-        "text": f"Booked your appointment for {readable_start_time}.",
+        "text": booking_success_text(readable_start_time),
+        "remove_keyboard": True,
     })
 
     return Command(

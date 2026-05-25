@@ -46,6 +46,29 @@ def _normalize_trajectory(value: Any) -> list[str]:
     return [str(item) for item in value]
 
 
+def _as_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    return value if isinstance(value, list) else []
+
+
+def _message_text(outputs: dict[str, Any]) -> str:
+    messages = _as_list(outputs.get("messages"))
+    parts = []
+    for message in messages:
+        if isinstance(message, dict):
+            parts.append(str(message.get("text", "")))
+    return "\n".join(parts).lower()
+
+
+def _has_keyboard(outputs: dict[str, Any]) -> bool:
+    messages = _as_list(outputs.get("messages"))
+    return any(isinstance(message, dict) and bool(message.get("keyboard")) for message in messages)
+
+
 def _trajectory_variants(trajectory: list[str]) -> list[list[str]]:
     variants = [trajectory]
     if trajectory and trajectory[-1] == "__end__":
@@ -123,3 +146,48 @@ def expected_state_match_evaluator(run: Any, example: Any) -> dict[str, Any]:
         preview = f"{preview}; {remaining} more mismatch(es)"
     return {"score": 0, "comment": preview}
 
+
+def user_experience_assertions_evaluator(run: Any, example: Any) -> dict[str, Any]:
+    """Score UX assertions declared in expected_result.ux_assertions."""
+
+    run_outputs = _get_outputs(run)
+    example_outputs = _get_example_outputs(example)
+    assertions = _as_dict(example_outputs.get("ux_assertions"))
+    if not assertions:
+        return {"score": 1, "comment": "No UX assertions requested."}
+
+    text = _message_text(run_outputs)
+    trajectory = _normalize_trajectory(run_outputs.get("trajectory"))
+    final_state = _as_dict(run_outputs.get("final_state"))
+
+    checks = {
+        "no_slot_recovery": (
+            "try another date" in text
+            and "different provider" in text
+            and "book_appointment" not in trajectory
+        ),
+        "privacy_copy": (
+            "before i can book" in text
+            or "i will store only the fields you confirm" in text
+        ),
+        "profile_privacy_copy": "i will store only the fields you confirm" in text,
+        "cancel_flow": (
+            final_state.get("conversation_status") == "cancelled"
+            and "book_appointment" not in trajectory
+            and "store_in_supabase" not in trajectory
+        ),
+        "invalid_choice_retry": "i did not recognize" in text,
+        "telegram_buttons": _has_keyboard(run_outputs),
+    }
+
+    failures = [
+        key for key, expected in assertions.items()
+        if expected is True and not checks.get(key, False)
+    ]
+    if not failures:
+        return {"score": 1, "comment": "UX assertions passed."}
+
+    return {
+        "score": 0,
+        "comment": "Failed UX assertions: " + ", ".join(failures),
+    }

@@ -83,14 +83,16 @@ def send_message(
     web_app_url: str | None = None,
     request_location: bool = False,
     remove_keyboard: bool = False,
+    keyboard: list[list[str]] | None = None,
 ) -> dict:
     """Send an outbound message to a user via the Telegram bot.
 
     When `web_app_url` is set, attaches a reply keyboard with an Open login
     Mini App button and a Done button. When `request_location` is True,
     attaches a Telegram reply keyboard button that requests the user's
-    current location. When `remove_keyboard` is True, asks Telegram clients to
-    remove the current custom keyboard.
+    current location. When `keyboard` is set, attaches text reply buttons. When
+    `remove_keyboard` is True, asks Telegram clients to remove the current
+    custom keyboard.
     """
 
     load_dotenv()
@@ -111,6 +113,12 @@ def send_message(
     elif request_location:
         payload["reply_markup"] = {
             "keyboard": [[{"text": "Share location", "request_location": True}]],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+    elif keyboard:
+        payload["reply_markup"] = {
+            "keyboard": [[{"text": item} for item in row] for row in keyboard],
             "resize_keyboard": True,
             "one_time_keyboard": True,
         }
