@@ -5,8 +5,10 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.124.0",
     "langchain>=1.3.0",
     "langgraph>=1.2.0",
+    "langgraph-checkpoint-postgres>=3.0.0",
     "langgraph-cli[inmem]>=0.4.26",
     "python-dotenv>=1.0.0",
     "httpx>=0.27.0",
@@ -15,4 +17,7 @@ dependencies = [
     "supabase>=2.30.0",
     "stagehand>=3.20.0",
     "langchain-openai>=1.2.1",
+    "psycopg[binary]>=3.2.0",
+    "pytest>=9.0.0",
+    "uvicorn>=0.47.0",
 ]

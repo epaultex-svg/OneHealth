@@ -26,6 +26,12 @@ from state import (
     TextClassification,
     UserInfoExtracted,
 )
+from appointments import (
+    appointment_booking_key,
+    mark_appointment_booked,
+    mark_appointment_failed,
+    reserve_appointment_booking,
+)
 from tools import (
     read_message,
     send_message,
@@ -49,16 +55,22 @@ def _model(temperature: float = 0.0) -> ChatOpenRouter:
 
 def _normalize_resume_message(resume: object, state: OneHealthAgentState) -> dict | None:
     """Convert Studio resume payloads into the Telegram message shape."""
-    chat_id = str(state.get("chat_id", ""))
-    update_id = state.get("update_id")
-    username = state.get("username") or ""
+    state_chat_id = str(state.get("chat_id", ""))
+    state_update_id = state.get("update_id")
+    state_username = state.get("username") or ""
 
-    def message(content: str, location: dict | None = None) -> dict:
+    def message(
+        content: str,
+        location: dict | None = None,
+        *,
+        source: dict | None = None,
+    ) -> dict:
+        source = source or {}
         return {
-            "chat_id": chat_id,
+            "chat_id": str(source.get("chat_id") or state_chat_id),
             "user_message_content": content,
-            "username": username,
-            "update_id": update_id,
+            "username": source.get("username") or state_username,
+            "update_id": source.get("update_id", state_update_id),
             "location": location,
         }
 
@@ -73,16 +85,24 @@ def _normalize_resume_message(resume: object, state: OneHealthAgentState) -> dic
     for key in ("user_message_content", "text", "message", "content"):
         value = resume.get(key)
         if isinstance(value, str) and value.strip():
-            return message(value.strip(), location if isinstance(location, dict) else None)
+            return message(
+                value.strip(),
+                location if isinstance(location, dict) else None,
+                source=resume,
+            )
 
     raw_message = resume.get("message")
     if isinstance(raw_message, dict):
         text = raw_message.get("text")
         if isinstance(text, str) and text.strip():
-            return message(text.strip(), location if isinstance(location, dict) else None)
+            return message(
+                text.strip(),
+                location if isinstance(location, dict) else None,
+                source=resume,
+            )
 
     if isinstance(location, dict):
-        return message(str(state.get("user_message_content") or ""), location)
+        return message(str(state.get("user_message_content") or ""), location, source=resume)
 
     return None
 
@@ -253,6 +273,15 @@ def _extract_items(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
 
 def _record_id(record: dict[str, Any]) -> int | None:
     value = record.get("id")
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_int(value: object) -> int | None:
     if value is None:
         return None
     try:
@@ -457,6 +486,22 @@ def _collect_patient_info(state: OneHealthAgentState) -> PatientInfo:
     return patient_info
 
 
+def _merge_patient_info(
+    primary: PatientInfo | None,
+    fallback: PatientInfo | dict[str, Any] | None,
+) -> PatientInfo:
+    merged: PatientInfo = {}
+    for key, value in dict(fallback or {}).items():
+        cleaned = _clean(value)
+        if cleaned:
+            merged[key] = cleaned
+    for key, value in dict(primary or {}).items():
+        cleaned = _clean(value)
+        if cleaned:
+            merged[key] = cleaned
+    return merged
+
+
 def _patient_search_name(patient_info: PatientInfo) -> str:
     return " ".join(
         part for part in [
@@ -496,6 +541,23 @@ def _patient_payload(patient_info: PatientInfo, provider_id: int) -> dict[str, A
         "patient": patient,
         "return_existing_if_match": True,
     }
+
+
+def _patient_search_params(location_id: int, patient_info: PatientInfo) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "location_id": location_id,
+        "new_patient": False,
+        "include_upcoming_appts": False,
+        "location_strict": False,
+        "per_page": 5,
+        "name": _patient_search_name(patient_info),
+        "date_of_birth": patient_info["date_of_birth"],
+    }
+    if not _is_missing(patient_info.get("phone_number")):
+        params["phone_number"] = patient_info["phone_number"]
+    if not _is_missing(patient_info.get("email")):
+        params["email"] = patient_info["email"]
+    return params
 
 
 def _normalize_patient_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -604,7 +666,7 @@ def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_lo
     Uses state when LangSmith Studio or a resumed thread already seeded
     chat_id and user_message_content; otherwise polls Telegram via read_message().
     On first contact stores chat_id and username in Supabase. Routes to
-    'request_user_location' if new user or missing location, else 'classify_intent'.
+    'request_user_location' if new user or /add_location, else 'classify_intent'.
     """
     state_chat_id = state.get("chat_id")
     state_message = state.get("user_message_content")
@@ -627,7 +689,9 @@ def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_lo
 
     chat_id = msg["chat_id"]
     username = msg["username"]
+    message_content = msg["user_message_content"]
     next_node = "classify_intent"
+    location_request_reason = None
 
     if chat_id:
         client = create_client(
@@ -639,34 +703,48 @@ def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_lo
         if not row.data:
             store_info.invoke({"chat_id": chat_id, "username": username or None})
             next_node = "request_user_location"
+            location_request_reason = "new_user"
         else:
-            location = row.data[0].get("location")
-            if not location:
+            if message_content == "/add_location":
                 next_node = "request_user_location"
-            elif msg["user_message_content"] == "/add_location":
-                next_node = "request_user_location"
+                location_request_reason = "add_location"
 
     return Command(
         update={
             "chat_id": chat_id,
-            "user_message_content": msg["user_message_content"],
+            "user_message_content": message_content,
             "user_location": msg.get("location"),
+            "location_request_reason": location_request_reason,
             "username": username,
             "update_id": msg["update_id"],
+            "classify_current_message": next_node == "classify_intent",
         },
         goto=next_node,
     )
 
 
-def request_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"]]:
-    """Prompt user for location, wait for reply, store or skip, then continue."""
+def request_user_location(state: OneHealthAgentState) -> Command[Literal["await_user_location"]]:
+    """Prompt user for location, then route to the waiting node."""
     chat_id = state["chat_id"]
+
+    send_message.invoke({
+        "chat_id": chat_id,
+        "text": "Please share your location for best results.",
+        "request_location": True,
+    })
+    return Command(goto="await_user_location")
+
+
+def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard", "classify_intent"]]:
+    """Wait for location reply, store it, then continue based on request reason."""
+    chat_id = state["chat_id"]
+    reason = state.get("location_request_reason") or "new_user"
 
     resume = interrupt({
         "chat_id": chat_id,
         "prompt": "Please share your location for best results.",
     })
-    reply = _normalize_resume_message(resume, state) or resume
+    reply = _normalize_resume_message(resume, state) or _resume_or_telegram_message(resume, state)
 
     location = reply.get("location") if isinstance(reply, dict) else None
 
@@ -678,13 +756,47 @@ def request_user_location(state: OneHealthAgentState) -> Command[Literal["onboar
             "text": "No worries... you can change this later using /add_location",
         })
 
-    send_message.invoke({"chat_id": chat_id, "text": "How can I help?"})
-    return Command(goto="onboard")
+    reply_update_id = reply.get("update_id") if isinstance(reply, dict) else state.get("update_id")
+
+    if reason == "add_location":
+        message_content = "Location added." if location else "Location not added."
+        send_message.invoke({
+            "chat_id": chat_id,
+            "text": message_content,
+            "remove_keyboard": True,
+        })
+        return Command(
+            update={
+                "user_message_content": message_content,
+                "user_location": location,
+                "location_request_reason": None,
+                "update_id": reply_update_id,
+            },
+            goto="classify_intent",
+        )
+
+    send_message.invoke({
+        "chat_id": chat_id,
+        "text": "How can I help?",
+        "remove_keyboard": True,
+    })
+    return Command(
+        update={
+            "user_location": location,
+            "location_request_reason": None,
+            "update_id": reply_update_id,
+        },
+        goto="onboard",
+    )
 
 def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent"]]:
     """Asks user for all necessary information to create an appointment via Nexhealth. Stores all info in state, and uses store_info to store in Supabase info
     unlikely to change."""
     patient_info = _collect_patient_info(state)
+    store_info.invoke({
+        "chat_id": state["chat_id"],
+        "patient_info": patient_info,
+    })
     return Command(update={"patient_info": patient_info}, goto="classify_intent")
 
 def classify_intent(
@@ -693,9 +805,17 @@ def classify_intent(
     """Wait for user reply, fetch it via Telegram, classify intent, route on result."""
     chat_id = state["chat_id"]
 
-    resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_user_message"})
-
-    msg = _resume_or_telegram_message(resume, state)
+    if state.get("classify_current_message") and state.get("user_message_content"):
+        msg = {
+            "chat_id": chat_id,
+            "user_message_content": state["user_message_content"],
+            "username": state.get("username") or "",
+            "update_id": state.get("update_id"),
+            "location": state.get("user_location"),
+        }
+    else:
+        resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_user_message"})
+        msg = _resume_or_telegram_message(resume, state)
 
     system = (
         "Classify the user's message into exactly one intent:\n"
@@ -721,6 +841,7 @@ def classify_intent(
             "user_message_content": msg["user_message_content"],
             "user_message_classification": classification,
             "update_id": msg["update_id"],
+            "classify_current_message": False,
         },
         goto=next_node,
     )
@@ -731,9 +852,9 @@ def draft_appointment_details(
     """Draft a confirmation message string for the user.
 
     Reads user_message_content from state and saved location/insurance from
-    Supabase. Single LLM invoke produces the formatted confirmation text.
-    Stores the draft string under state["appt_draft"] and routes to
-    user_confirmation.
+    Supabase. Single LLM invoke extracts details; Python formats the fixed
+    confirmation text. Stores the draft string under state["appt_draft"] and
+    routes to user_confirmation.
     """
     chat_id = state["chat_id"]
     user_message_content = state["user_message_content"]
@@ -752,29 +873,6 @@ def draft_appointment_details(
     saved_location = user_row.get("location") or {}
     saved_insurance = user_row.get("insurance") or {}
 
-    system = (
-        "You are an appointment intake assistant. Read the user's message "
-        "and draft a confirmation message back to them.\n\n"
-        f"Saved user location: {saved_location}\n"
-        f"Saved user insurance: {saved_insurance}\n\n"
-        "Use the saved values when the user did not specify a value. "
-        "Use 'not specified' if neither is available.\n\n"
-        "Respond with ONLY the confirmation text, exactly in this format:\n"
-        "Just confirming your appointment details...\n"
-        "- Date: <date>\n"
-        "- Specialty: <specialty>\n"
-        "- Practice: <practice>\n"
-        "- Reason: <reason>\n"
-        "- Insurance: <insurance>\n"
-        "- Location: <location>\n"
-        "Does this look right?"
-    )
-
-    draft: str = _model().invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=user_message_content),
-    ]).content
-
     extract_system = (
         "Extract structured appointment details from the user's message. "
         "Use saved location/insurance when the user did not specify a value. "
@@ -788,6 +886,16 @@ def draft_appointment_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
+    draft = (
+        "Just confirming your appointment details...\n"
+        f"- Date: {details.get('Date', 'not specified')}\n"
+        f"- Specialty: {details.get('Specialty', 'not specified')}\n"
+        f"- Practice: {details.get('Practice', 'not specified')}\n"
+        f"- Reason: {details.get('Reason', 'not specified')}\n"
+        f"- Insurance: {details.get('Insurance', 'not specified')}\n"
+        f"- Location: {details.get('Location', 'not specified')}\n"
+        "Does this look right?"
+    )
 
     return Command(
         update={"appt_draft": draft, "appt_details": details},
@@ -1172,36 +1280,72 @@ def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"
 
 def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_type"]]:
     """Retrieve existing NexHealth patient or create one, then store patient ID."""
-    if state.get("nexhealth_patient_id"):
-        return Command(goto="get_appointment_type")
-
     location_id = state.get("nexhealth_location_id")
     provider_id = state.get("nexhealth_provider_id")
     if location_id is None or provider_id is None:
         raise RuntimeError("Cannot get NexHealth patient without location and provider IDs")
 
-    patient_info = _collect_patient_info(state)
-    search_params: dict[str, Any] = {
-        "location_id": location_id,
-        "new_patient": False,
-        "include_upcoming_appts": False,
-        "location_strict": False,
-        "per_page": 5,
-        "name": _patient_search_name(patient_info),
-        "date_of_birth": patient_info["date_of_birth"],
-    }
-    if not _is_missing(patient_info.get("phone_number")):
-        search_params["phone_number"] = patient_info["phone_number"]
-    if not _is_missing(patient_info.get("email")):
-        search_params["email"] = patient_info["email"]
+    client = create_client(
+        os.getenv("NEXT_PUBLIC_SUPABASE_URL"),
+        os.getenv("NEXT_PRIVATE_SUPABASE_API_KEY"),
+    )
+    row = (
+        client.table("users")
+        .select("patient_info, nexhealth_patient_id")
+        .eq("chat_id", state["chat_id"])
+        .execute()
+    )
+    user_row = row.data[0] if row.data else {}
+    stored_patient_info = user_row.get("patient_info")
+    if not isinstance(stored_patient_info, dict):
+        stored_patient_info = {}
+
+    patient_info = _merge_patient_info(
+        state.get("patient_info"),
+        stored_patient_info,
+    )
+    patient_info = _collect_patient_info({**state, "patient_info": patient_info})
+    cached_patient_id = (
+        _coerce_int(state.get("nexhealth_patient_id"))
+        or _coerce_int(user_row.get("nexhealth_patient_id"))
+    )
 
     payload, token_update = _nexhealth_request(
         state,
         "GET",
         "/patients",
-        params=search_params,
+        params=_patient_search_params(location_id, patient_info),
     )
-    patients = _extract_items(payload, "patients")
+    patients = [
+        _normalize_patient_record(patient)
+        for patient in _extract_items(payload, "patients")
+    ]
+
+    if cached_patient_id is not None:
+        verified = next(
+            (
+                patient
+                for patient in patients
+                if _record_id(patient) == cached_patient_id
+                and _patient_matches(patient, patient_info)
+            ),
+            None,
+        )
+        if verified is not None:
+            store_info.invoke({
+                "chat_id": state["chat_id"],
+                "patient_info": patient_info,
+                "nexhealth_patient_id": cached_patient_id,
+            })
+            return Command(
+                update={
+                    **token_update,
+                    "patient_info": patient_info,
+                    "nexhealth_patient_id": cached_patient_id,
+                },
+                goto="get_appointment_type",
+            )
+
     selected = next((patient for patient in patients if _patient_matches(patient, patient_info)), None)
     if selected is None and patients:
         selected = patients[0]
@@ -1225,6 +1369,12 @@ def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_
     patient_id = _record_id(selected)
     if patient_id is None:
         raise RuntimeError(f"NexHealth patient response missing id: {selected}")
+
+    store_info.invoke({
+        "chat_id": state["chat_id"],
+        "patient_info": patient_info,
+        "nexhealth_patient_id": patient_id,
+    })
 
     return Command(
         update={
@@ -1420,6 +1570,7 @@ def select_appointment_slot(state: OneHealthAgentState) -> Command[Literal["book
 
 def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     """Book user's appointment using NexHealth API and confirmed details."""
+    chat_id = state["chat_id"]
     location_id = state.get("nexhealth_location_id")
     provider_id = state.get("nexhealth_provider_id")
     patient_id = state.get("nexhealth_patient_id")
@@ -1431,6 +1582,15 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     if None in (location_id, provider_id, patient_id, appointment_type_id) or not start_time or operatory_id is None:
         raise RuntimeError("Cannot book NexHealth appointment without patient/provider/type/slot details")
 
+    booking_key = appointment_booking_key(
+        chat_id=chat_id,
+        patient_id=int(patient_id),
+        location_id=int(location_id),
+        provider_id=int(slot.get("provider_id") or provider_id),
+        appointment_type_id=int(appointment_type_id),
+        start_time=start_time,
+        operatory_id=int(operatory_id),
+    )
     appt_payload = {
         "appt": {
             "patient_id": patient_id,
@@ -1440,21 +1600,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
             "appointment_type_id": appointment_type_id,
         }
     }
-    payload, token_update = _nexhealth_request(
-        state,
-        "POST",
-        "/appointments",
-        params={
-            "location_id": location_id,
-            "notify_patient": False,
-        },
-        json_body=appt_payload,
-    )
-
-    result = _payload_data(payload)
-    appointment_record = result.get("appointment") if isinstance(result, dict) else result
     persisted_details = {
-        "appointment": appointment_record,
         "appointment_details": state.get("appt_details") or {},
         "patient_id": patient_id,
         "provider_id": provider_id,
@@ -1462,13 +1608,56 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
         "appointment_type_id": appointment_type_id,
         "slot": slot,
     }
-    store_info.invoke({
-        "chat_id": state["chat_id"],
-        "website": "nexhealth",
-        "appt_details": persisted_details,
-    })
+    reservation = reserve_appointment_booking(
+        booking_key=booking_key,
+        chat_id=chat_id,
+        details={**persisted_details, "booking_key": booking_key},
+    )
+    if not reservation.get("should_book"):
+        status = reservation.get("status")
+        text = (
+            f"Booked your appointment for {start_time}."
+            if status == "booked"
+            else "That appointment is already being processed, so I won't create a duplicate booking."
+        )
+        send_message.invoke({"chat_id": chat_id, "text": text})
+        return Command(
+            update={
+                "appointment_booking_key": booking_key,
+                "appointment_booking_status": status,
+            },
+            goto=END,
+        )
+
+    try:
+        payload, token_update = _nexhealth_request(
+            state,
+            "POST",
+            "/appointments",
+            params={
+                "location_id": location_id,
+                "notify_patient": False,
+            },
+            json_body=appt_payload,
+        )
+    except Exception as exc:
+        mark_appointment_failed(booking_key=booking_key, error=f"{type(exc).__name__}: {exc}")
+        raise
+
+    result = _payload_data(payload)
+    appointment_record = result.get("appointment") if isinstance(result, dict) else result
+    appointment_id = None
+    if isinstance(appointment_record, dict):
+        value = appointment_record.get("id")
+        appointment_id = str(value) if value is not None else None
+    mark_appointment_booked(
+        booking_key=booking_key,
+        nexhealth_payload=appt_payload,
+        nexhealth_response=payload,
+        nexhealth_appointment_id=appointment_id,
+    )
     send_message.invoke({
-        "chat_id": state["chat_id"],
+        "chat_id": chat_id,
         "text": f"Booked your appointment for {start_time}.",
     })
 
@@ -1477,6 +1666,8 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
             **token_update,
             "book_appointment_result": payload,
             "nexhealth_appointment_result": payload,
+            "appointment_booking_key": booking_key,
+            "appointment_booking_status": "booked",
         },
         goto=END,
     )

@@ -77,11 +77,20 @@ def read_message() -> dict:
 
 
 @tool
-def send_message(chat_id: str, text: str, web_app_url: str | None = None) -> dict:
+def send_message(
+    chat_id: str,
+    text: str,
+    web_app_url: str | None = None,
+    request_location: bool = False,
+    remove_keyboard: bool = False,
+) -> dict:
     """Send an outbound message to a user via the Telegram bot.
 
     When `web_app_url` is set, attaches a reply keyboard with an Open login
-    Mini App button and a Done button.
+    Mini App button and a Done button. When `request_location` is True,
+    attaches a Telegram reply keyboard button that requests the user's
+    current location. When `remove_keyboard` is True, asks Telegram clients to
+    remove the current custom keyboard.
     """
 
     load_dotenv()
@@ -99,6 +108,14 @@ def send_message(chat_id: str, text: str, web_app_url: str | None = None) -> dic
             "resize_keyboard": True,
             "one_time_keyboard": True,
         }
+    elif request_location:
+        payload["reply_markup"] = {
+            "keyboard": [[{"text": "Share location", "request_location": True}]],
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+    elif remove_keyboard:
+        payload["reply_markup"] = {"remove_keyboard": True}
 
     response = httpx.post(url, json=payload, timeout=10.0)
     response.raise_for_status()
@@ -138,15 +155,20 @@ def store_info(
     context_id: str | None = None,
     appt_details: dict | None = None,
     insurance: dict | None = None,
+    patient_info: dict | None = None,
+    nexhealth_patient_id: int | None = None,
 ) -> dict:
     """Upsert user data into the Supabase `users` table.
 
-    Pass only the fields you have. `location` and `insurance` are
+    Pass only the fields you have. `location`, `insurance`, and
+    `patient_info` are
     overwrite-on-update (`location` expects raw Telegram payload
     `{"latitude": float, "longitude": float}`; `insurance` is a free-form
-    dict, e.g. `{"provider": str, "member_id": str, "group_id": str}`).
-    Arrays (browserbase_context_ids, appointments) are append-only;
-    existing entries are preserved.
+    dict, e.g. `{"provider": str, "member_id": str, "group_id": str}`;
+    `patient_info` stores NexHealth demographics).
+    `browserbase_context_ids` is append-only; existing entries are preserved.
+    `appt_details` is ignored because normalized booking records now live in
+    the `appointments` table.
     """
     load_dotenv()
     client = create_client(
@@ -158,7 +180,6 @@ def store_info(
     row = existing.data[0] if existing.data else {
         "chat_id": chat_id,
         "browserbase_context_ids": [],
-        "appointments": [],
     }
 
     fields_written: list[str] = []
@@ -180,15 +201,11 @@ def store_info(
     if insurance is not None:
         row["insurance"] = insurance
         fields_written.append("insurance")
-    if website and appt_details:
-        row["appointments"] = (row.get("appointments") or []) + [
-            {
-                "website": website,
-                "details": appt_details,
-                "booked_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ]
-        fields_written.append("appointments")
-
+    if patient_info is not None:
+        row["patient_info"] = patient_info
+        fields_written.append("patient_info")
+    if nexhealth_patient_id is not None:
+        row["nexhealth_patient_id"] = nexhealth_patient_id
+        fields_written.append("nexhealth_patient_id")
     client.table("users").upsert(row, on_conflict="chat_id").execute()
     return {"success": True, "chat_id": chat_id, "fields_written": fields_written}

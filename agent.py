@@ -3,6 +3,7 @@ from langgraph.graph import START, StateGraph
 
 from nodes import (
     book_appointment,
+    await_user_location,
     classify_intent,
     correct_info,
     draft_appointment_details,
@@ -37,6 +38,7 @@ def build_graph(checkpointer=None):
 
     workflow.add_node("start_thread", start_thread)
     workflow.add_node("request_user_location", request_user_location)
+    workflow.add_node("await_user_location", await_user_location)
     workflow.add_node("onboard", onboard)
     workflow.add_node("classify_intent", classify_intent)
     workflow.add_node("draft_appointment_details", draft_appointment_details)

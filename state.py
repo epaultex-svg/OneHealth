@@ -51,6 +51,8 @@ class OneHealthAgentState(TypedDict, total=False):
     update_id: int
     user_message_content: str
     user_location: dict | None
+    location_request_reason: Literal["new_user", "add_location"] | None
+    classify_current_message: bool
     username: str
     message_history: list[str]
     user_message_classification: TextClassification | None
@@ -72,6 +74,8 @@ class OneHealthAgentState(TypedDict, total=False):
     nexhealth_available_slots: list[NexHealthSlot]
     nexhealth_selected_slot: NexHealthSlot | None
     nexhealth_appointment_result: dict | None
+    appointment_booking_key: str | None
+    appointment_booking_status: str | None
 
     # user info storage
     user_info_draft: str

@@ -1,0 +1,40 @@
+{
+  "patients": [
+    {
+      "id": 488169641,
+      "email": "Abbi.Mathis.229.21371@example.com",
+      "first_name": "Abbi",
+      "middle_name": null,
+      "last_name": "Mathis",
+      "name": "Abbi Mathis",
+      "created_at": "2026-05-14T02:39:54.211Z",
+      "updated_at": "2026-05-14T02:39:54.211Z",
+      "institution_id": 21371,
+      "foreign_id": "a9267d48-dcce-4aa1-a8d4-95551acc5924",
+      "foreign_id_type": "remote_db-dentrix-DataSource-35518",
+      "bio": {
+        "gender": "Female",
+        "phone_number": "5572496717",
+        "date_of_birth": "1956-04-15",
+        "verified_mobile": "5572496717"
+      },
+      "inactive": false,
+      "last_sync_time": null,
+      "guarantor_id": null,
+      "unsubscribe_sms": false,
+      "balance": {
+        "amount": "0.00",
+        "currency": "USD"
+      },
+      "billing_type": null,
+      "chart_id": null,
+      "preferred_language": null,
+      "preferred_locale": null,
+      "location_ids": [
+        348864
+      ],
+      "provider_id": null
+    }
+  ],
+  "count": 104
+}
