@@ -2,7 +2,18 @@ from typing import Literal, Required, TypedDict
 
 
 class TextClassification(TypedDict):
-    intent: Literal["user_info", "appointment"]
+    intent: Literal[
+        "user_info",
+        "appointment",
+        "location_update",
+        "greeting",
+        "about_assistant",
+        "help",
+        "general_response",
+        "unsupported",
+    ]
+    confidence: float
+    reason: str
 
 
 class ConfirmationDecision(TypedDict):
@@ -57,6 +68,7 @@ class OneHealthAgentState(TypedDict, total=False):
     username: str
     message_history: list[str]
     user_message_classification: TextClassification | None
+    direct_response: str
 
     # appointment information
     appt_details: AppointmentDetails

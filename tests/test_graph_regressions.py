@@ -14,8 +14,15 @@ class FakeStructured:
 
 
 class FakeModel:
+    def __init__(self, structured=None, content="ok"):
+        self.structured = structured or {"intent": "appointment"}
+        self.content = content
+
     def with_structured_output(self, schema):
-        return FakeStructured({"intent": "appointment"})
+        return FakeStructured(self.structured)
+
+    def invoke(self, messages):
+        return type("Response", (), {"content": self.content})()
 
 
 class FakeTool:
@@ -24,6 +31,28 @@ class FakeTool:
 
     def invoke(self, payload):
         return self.fn(payload)
+
+
+class FakeSupabaseTable:
+    def __init__(self, data):
+        self.data = data
+
+    def select(self, fields):
+        return self
+
+    def eq(self, field, value):
+        return self
+
+    def execute(self):
+        return type("Result", (), {"data": self.data})()
+
+
+class FakeSupabaseClient:
+    def __init__(self, data):
+        self.data = data
+
+    def table(self, name):
+        return FakeSupabaseTable(self.data)
 
 
 def test_conversation_state_table_covers_user_facing_steps():
@@ -65,6 +94,52 @@ def test_normalize_resume_message_preserves_webhook_metadata():
     assert message["location"] == {"latitude": 1, "longitude": 2}
 
 
+def test_receive_message_uses_seeded_webhook_input_without_polling(monkeypatch):
+    monkeypatch.setattr(nodes, "read_message", FakeTool(lambda payload: pytest.fail("should not poll")))
+
+    command = nodes.receive_message(
+        {
+            "chat_id": "888",
+            "user_message_content": "hi",
+            "username": "paul",
+            "update_id": 10,
+        }
+    )
+
+    assert command.goto == "ensure_user"
+    assert command.update["chat_id"] == "888"
+    assert command.update["user_message_content"] == "hi"
+    assert command.update["classify_current_message"] is True
+
+
+def test_receive_message_ends_when_no_message(monkeypatch):
+    monkeypatch.setattr(nodes, "read_message", FakeTool(lambda payload: {}))
+
+    command = nodes.receive_message({})
+
+    assert command.goto == nodes.END
+
+
+def test_ensure_user_creates_minimal_row_and_routes_to_classifier(monkeypatch):
+    stored = []
+    monkeypatch.setattr(nodes, "create_client", lambda *args, **kwargs: FakeSupabaseClient([]))
+    monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: stored.append(payload)))
+
+    command = nodes.ensure_user({"chat_id": "888", "username": "paul"})
+
+    assert command.goto == "classify_intent"
+    assert stored == [{"chat_id": "888", "username": "paul"}]
+
+
+def test_ensure_user_existing_user_skips_onboarding(monkeypatch):
+    monkeypatch.setattr(nodes, "create_client", lambda *args, **kwargs: FakeSupabaseClient([{"chat_id": "888"}]))
+    monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: pytest.fail("should not write")))
+
+    command = nodes.ensure_user({"chat_id": "888", "username": "paul"})
+
+    assert command.goto == "classify_intent"
+
+
 def test_classify_intent_uses_seeded_message_without_interrupt(monkeypatch):
     monkeypatch.setattr(nodes, "_model", lambda: FakeModel())
 
@@ -86,6 +161,137 @@ def test_classify_intent_uses_seeded_message_without_interrupt(monkeypatch):
     assert command.update["user_message_content"] == "Book me tomorrow"
     assert command.update["update_id"] == 10
     assert command.update["classify_current_message"] is False
+
+
+def test_classify_intent_routes_greeting_to_direct_response_without_model(monkeypatch):
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("greeting should be deterministic"))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: pytest.fail("should not interrupt seeded input"))
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": "hi",
+            "update_id": 10,
+            "classify_current_message": True,
+        }
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["user_message_classification"]["intent"] == "greeting"
+
+
+def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda: FakeModel({"intent": "appointment", "confidence": 0.2, "reason": "unclear"}),
+    )
+
+    about = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "tell me about yourself", "classify_current_message": True}
+    )
+    help_command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "help", "classify_current_message": True}
+    )
+    add_location = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "/add_location", "classify_current_message": True}
+    )
+    location_payload = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": "",
+            "user_location": {"latitude": 1, "longitude": 2},
+            "classify_current_message": True,
+        }
+    )
+    low_confidence = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "???", "classify_current_message": True}
+    )
+
+    assert about.update["user_message_classification"]["intent"] == "about_assistant"
+    assert help_command.update["user_message_classification"]["intent"] == "help"
+    assert add_location.goto == "request_user_location"
+    assert add_location.update["location_request_reason"] == "add_location"
+    assert location_payload.goto == "store_user_location"
+    assert low_confidence.goto == "send_direct_response"
+    assert low_confidence.update["user_message_classification"]["intent"] == "unsupported"
+
+
+def test_send_direct_response_uses_fixed_copy_without_side_effects(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("fixed copy should not call model"))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: pytest.fail("should not store")))
+
+    command = nodes.send_direct_response(
+        {
+            "chat_id": "888",
+            "user_message_content": "tell me about yourself",
+            "user_message_classification": {"intent": "about_assistant"},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert "OneHealth" in sent[-1]["text"]
+    assert sent[-1]["remove_keyboard"] is True
+
+
+def test_send_direct_response_general_uses_safe_model(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "_model", lambda: FakeModel(content="I can help schedule appointments."))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_direct_response(
+        {
+            "chat_id": "888",
+            "user_message_content": "Can you help with dermatology?",
+            "user_message_classification": {"intent": "general_response"},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert sent[-1]["text"] == "I can help schedule appointments."
+
+
+def test_store_user_location_stores_top_level_location_and_ends(monkeypatch):
+    sent = []
+    stored = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: stored.append(payload)))
+
+    command = nodes.store_user_location(
+        {
+            "chat_id": "888",
+            "user_location": {"latitude": 1, "longitude": 2},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert stored == [{"chat_id": "888", "location": {"latitude": 1, "longitude": 2}}]
+    assert sent[-1]["text"] == "Location saved."
+
+
+def test_await_user_location_add_location_ends_after_storing(monkeypatch):
+    sent = []
+    stored = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: stored.append(payload)))
+    monkeypatch.setattr(
+        nodes,
+        "interrupt",
+        lambda payload: {"text": "", "location": {"latitude": 1, "longitude": 2}, "update_id": 12},
+    )
+
+    command = nodes.await_user_location(
+        {
+            "chat_id": "888",
+            "location_request_reason": "add_location",
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert stored == [{"chat_id": "888", "location": {"latitude": 1, "longitude": 2}}]
+    assert sent[-1]["text"] == "Location saved."
 
 
 def test_classify_intent_still_interrupts_without_seed_flag(monkeypatch):
@@ -272,7 +478,7 @@ def test_get_appointment_slots_empty_result_offers_recovery(monkeypatch):
 def test_user_experience_evaluator_scores_declared_assertions():
     run = {
         "outputs": {
-            "trajectory": ["start_thread", "get_appointment_slots", "__end__"],
+            "trajectory": ["receive_message", "ensure_user", "get_appointment_slots", "__end__"],
             "final_state": {"conversation_status": "cancelled"},
             "messages": [
                 {"text": "I could not find open slots. You can try another date, choose a different provider or appointment type, or reply Cancel."},
