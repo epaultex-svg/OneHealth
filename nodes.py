@@ -6,7 +6,7 @@ Model nodes call an LLM (via OpenRouter) and write structured output to state.
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal, TypedDict
+from typing import Any, Callable, Literal, TypedDict
 
 import httpx
 from dotenv import load_dotenv
@@ -316,6 +316,35 @@ def _record_label(record: dict[str, Any]) -> str:
     return label or f"ID {record.get('id')}"
 
 
+def _provider_label(record: dict[str, Any]) -> str:
+    bits = [
+        record.get("name"),
+        record.get("display_name"),
+        record.get("provider_name"),
+    ]
+    label = next((_clean(bit) for bit in bits if _clean(bit)), "")
+    if label:
+        return label
+
+    full_name = " ".join(
+        part for part in [
+            _clean(record.get("first_name")),
+            _clean(record.get("last_name")),
+        ]
+        if part
+    )
+    return full_name or _record_label(record)
+
+
+def _appointment_type_label(record: dict[str, Any]) -> str:
+    bits = [
+        record.get("title"),
+        record.get("name"),
+        record.get("display_name"),
+    ]
+    return next((_clean(bit) for bit in bits if _clean(bit)), _record_label(record))
+
+
 def _record_search_text(record: dict[str, Any]) -> str:
     nested = []
     for value in record.values():
@@ -352,11 +381,14 @@ def _choice_prompt(prompt: str, records: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-def _choice_options(records: list[dict[str, Any]]) -> list[NexHealthOption]:
+def _choice_options(
+    records: list[dict[str, Any]],
+    label_fn: Callable[[dict[str, Any]], str] = _record_label,
+) -> list[NexHealthOption]:
     return [
         {
             "id": _record_id(record),
-            "label": _record_label(record),
+            "label": label_fn(record),
             "record": record,
         }
         for record in records[:10]
@@ -366,7 +398,7 @@ def _choice_options(records: list[dict[str, Any]]) -> list[NexHealthOption]:
 def _options_text(title: str, options: list[NexHealthOption]) -> str:
     lines = [title]
     lines.extend(
-        f"{index}. {option.get('label')} (ID {option.get('id')})"
+        f"{index}. {option.get('label')}"
         for index, option in enumerate(options, start=1)
     )
     lines.append("Reply with the number you want.")
@@ -653,11 +685,18 @@ def _slot_time(slot: NexHealthSlot) -> str:
     return _clean(slot.get("time") or slot.get("start_time"))
 
 
+def _readable_datetime(value: str) -> str:
+    parsed = _parse_datetime(value)
+    if parsed is None:
+        return value
+
+    hour = parsed.hour % 12 or 12
+    return f"{parsed.strftime('%A, %B')} {parsed.day} at {hour}:{parsed:%M} {parsed:%p}"
+
+
 def _slot_label(slot: NexHealthSlot, index: int) -> str:
-    time = _slot_time(slot)
-    provider = slot.get("provider_id")
-    operatory = slot.get("operatory_id")
-    return f"{index}. {time} (provider {provider}, operatory {operatory})"
+    time = _readable_datetime(_slot_time(slot))
+    return f"{index}. {time}"
 
 
 def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent", "__end__"]]:
@@ -1223,7 +1262,7 @@ def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_o
         selected = _match_record(providers, desired)
 
     if selected is None:
-        options = _choice_options(providers)
+        options = _choice_options(providers, _provider_label)
         return Command(
             update={**token_update, "nexhealth_provider_options": options},
             goto="send_provider_options",
@@ -1419,7 +1458,7 @@ def get_appointment_type(state: OneHealthAgentState) -> Command[Literal["send_ap
         selected = _match_record(appointment_types, desired)
 
     if selected is None:
-        options = _choice_options(appointment_types)
+        options = _choice_options(appointment_types, _appointment_type_label)
         return Command(
             update={**token_update, "nexhealth_appointment_type_options": options},
             goto="send_appointment_type_options",
@@ -1577,6 +1616,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     appointment_type_id = state.get("nexhealth_appointment_type_id")
     slot = state.get("nexhealth_selected_slot") or {}
     start_time = _slot_time(slot)
+    readable_start_time = _readable_datetime(start_time)
     operatory_id = slot.get("operatory_id")
 
     if None in (location_id, provider_id, patient_id, appointment_type_id) or not start_time or operatory_id is None:
@@ -1616,7 +1656,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     if not reservation.get("should_book"):
         status = reservation.get("status")
         text = (
-            f"Booked your appointment for {start_time}."
+            f"Booked your appointment for {readable_start_time}."
             if status == "booked"
             else "That appointment is already being processed, so I won't create a duplicate booking."
         )
@@ -1658,7 +1698,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     )
     send_message.invoke({
         "chat_id": chat_id,
-        "text": f"Booked your appointment for {start_time}.",
+        "text": f"Booked your appointment for {readable_start_time}.",
     })
 
     return Command(
