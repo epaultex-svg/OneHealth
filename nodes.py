@@ -33,6 +33,7 @@ from appointments import (
     reserve_appointment_booking,
 )
 from conversation import (
+    about_assistant_text,
     appointment_confirmation_text,
     booking_duplicate_text,
     booking_success_text,
@@ -46,6 +47,9 @@ from conversation import (
     location_added_text,
     location_request_text,
     location_skipped_text,
+    greeting_text,
+    help_text,
+    medical_advice_redirect_text,
     no_appointment_types_text,
     no_locations_text,
     no_providers_text,
@@ -57,6 +61,7 @@ from conversation import (
     profile_confirmation_text,
     saved_text,
     scheduling_loading_text,
+    unsupported_text,
 )
 from tools import (
     read_message,
@@ -730,21 +735,15 @@ def _slot_label(slot: NexHealthSlot, index: int) -> str:
     return f"{index}. {time}"
 
 
-def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_location", "classify_intent", "__end__"]]:
-    """Read latest Telegram message, register new users, route on location.
-
-    Uses state when LangSmith Studio or a resumed thread already seeded
-    chat_id and user_message_content; otherwise polls Telegram via read_message().
-    On first contact stores chat_id and username in Supabase. Routes to
-    'request_user_location' if new user or /add_location, else 'classify_intent'.
-    """
+def receive_message(state: OneHealthAgentState) -> Command[Literal["ensure_user", "__end__"]]:
+    """Read or normalize one inbound Telegram message."""
     state_chat_id = state.get("chat_id")
     state_message = state.get("user_message_content")
 
-    if state_chat_id and state_message:
+    if state_chat_id and (state_message is not None or state.get("user_location")):
         msg = {
             "chat_id": str(state_chat_id),
-            "user_message_content": state_message,
+            "user_message_content": state_message or "",
             "username": state.get("username") or "",
             "update_id": state.get("update_id"),
             "location": state.get("user_location"),
@@ -757,40 +756,40 @@ def start_thread(state: OneHealthAgentState) -> Command[Literal["request_user_lo
         print("No message received")
         return Command(goto=END)
 
-    chat_id = msg["chat_id"]
-    username = msg["username"]
-    message_content = msg["user_message_content"]
-    next_node = "classify_intent"
-    location_request_reason = None
+    return Command(
+        update={
+            "chat_id": str(msg["chat_id"]),
+            "user_message_content": msg.get("user_message_content", ""),
+            "user_location": msg.get("location"),
+            "username": msg.get("username", ""),
+            "update_id": msg.get("update_id"),
+            "classify_current_message": True,
+        },
+        goto="ensure_user",
+    )
+
+
+def ensure_user(state: OneHealthAgentState) -> Command[Literal["classify_intent"]]:
+    """Create a minimal Supabase user row, then let intent routing decide UX."""
+    chat_id = state["chat_id"]
+    username = state.get("username") or None
 
     if chat_id:
         client = create_client(
             os.getenv("NEXT_PUBLIC_SUPABASE_URL"),
             os.getenv("NEXT_PRIVATE_SUPABASE_API_KEY"),
         )
-        row = client.table("users").select("location").eq("chat_id", chat_id).execute()
+        row = client.table("users").select("chat_id").eq("chat_id", chat_id).execute()
 
         if not row.data:
             store_info.invoke({"chat_id": chat_id, "username": username or None})
-            next_node = "request_user_location"
-            location_request_reason = "new_user"
-        else:
-            if message_content == "/add_location":
-                next_node = "request_user_location"
-                location_request_reason = "add_location"
 
-    return Command(
-        update={
-            "chat_id": chat_id,
-            "user_message_content": message_content,
-            "user_location": msg.get("location"),
-            "location_request_reason": location_request_reason,
-            "username": username,
-            "update_id": msg["update_id"],
-            "classify_current_message": next_node == "classify_intent",
-        },
-        goto=next_node,
-    )
+    return Command(goto="classify_intent")
+
+
+def start_thread(state: OneHealthAgentState) -> Command[Literal["ensure_user", "__end__"]]:
+    """Deprecated compatibility wrapper for old graph/eval references."""
+    return receive_message(state)
 
 
 def request_user_location(state: OneHealthAgentState) -> Command[Literal["await_user_location"]]:
@@ -805,7 +804,7 @@ def request_user_location(state: OneHealthAgentState) -> Command[Literal["await_
     return Command(goto="await_user_location")
 
 
-def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard", "classify_intent"]]:
+def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard", "classify_intent", "__end__"]]:
     """Wait for location reply, store it, then continue based on request reason."""
     chat_id = state["chat_id"]
     reason = state.get("location_request_reason") or "new_user"
@@ -842,7 +841,7 @@ def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"
                 "location_request_reason": None,
                 "update_id": reply_update_id,
             },
-            goto="classify_intent",
+            goto=END,
         )
 
     send_message.invoke({
@@ -871,16 +870,75 @@ def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent", "_
     })
     return Command(update={"patient_info": patient_info}, goto="classify_intent")
 
+
+def _normalized_text(text: object) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _deterministic_classification(msg: dict[str, Any]) -> TextClassification | None:
+    text = _normalized_text(msg.get("user_message_content"))
+    if msg.get("location"):
+        return {
+            "intent": "location_update",
+            "confidence": 1.0,
+            "reason": "telegram_location_payload",
+        }
+    if text == "/add_location":
+        return {
+            "intent": "location_update",
+            "confidence": 1.0,
+            "reason": "explicit_location_command",
+        }
+    if text in {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}:
+        return {"intent": "greeting", "confidence": 1.0, "reason": "greeting_phrase"}
+    if text in {"help", "/help", "what can you do", "what can you help with"}:
+        return {"intent": "help", "confidence": 1.0, "reason": "help_phrase"}
+    if text in {
+        "about",
+        "/about",
+        "tell me about yourself",
+        "who are you",
+        "what are you",
+    }:
+        return {"intent": "about_assistant", "confidence": 1.0, "reason": "about_phrase"}
+    if is_cancel_text(text):
+        return {"intent": "unsupported", "confidence": 1.0, "reason": "top_level_cancel"}
+    return None
+
+
+def _needs_medical_advice_redirect(text: str) -> bool:
+    normalized = _normalized_text(text)
+    advice_markers = (
+        "diagnose",
+        "symptom",
+        "symptoms",
+        "should i take",
+        "what medicine",
+        "medical advice",
+        "is this serious",
+    )
+    return any(marker in normalized for marker in advice_markers)
+
 def classify_intent(
     state: OneHealthAgentState,
-) -> Command[Literal["draft_appointment_details", "draft_user_info_storage_details"]]:
+) -> Command[
+    Literal[
+        "draft_appointment_details",
+        "draft_user_info_storage_details",
+        "request_user_location",
+        "store_user_location",
+        "send_direct_response",
+    ]
+]:
     """Wait for user reply, fetch it via Telegram, classify intent, route on result."""
     chat_id = state["chat_id"]
 
-    if state.get("classify_current_message") and state.get("user_message_content"):
+    if state.get("classify_current_message") and (
+        state.get("user_message_content") is not None or state.get("user_location")
+    ):
         msg = {
             "chat_id": chat_id,
-            "user_message_content": state["user_message_content"],
+            "user_message_content": state.get("user_message_content", ""),
             "username": state.get("username") or "",
             "update_id": state.get("update_id"),
             "location": state.get("user_location"),
@@ -889,34 +947,112 @@ def classify_intent(
         resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_user_message"})
         msg = _resume_or_telegram_message(resume, state)
 
-    system = (
-        "Classify the user's message into exactly one intent:\n"
-        "- 'appointment': user wants to book/reschedule/cancel a healthcare appointment.\n"
-        "- 'user_info': user is sharing preferences, profile data, or context "
-        "(insurance, providers, conditions, location, contact info).\n"
-        "Return only the intent label."
-    )
-    classifier = _model().with_structured_output(TextClassification)
-    classification: TextClassification = classifier.invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=msg["user_message_content"]),
-    ])
+    classification = _deterministic_classification(msg)
+    if classification is None:
+        system = (
+            "Classify the user's message into exactly one intent:\n"
+            "- 'appointment': user wants to book, reschedule, or cancel a healthcare appointment.\n"
+            "- 'user_info': user explicitly wants to store preferences, profile data, "
+            "insurance, contact info, or other context for future use.\n"
+            "- 'location_update': user wants to add, update, or share location.\n"
+            "- 'greeting': brief greeting only.\n"
+            "- 'about_assistant': user asks what OneHealth is or asks about the assistant.\n"
+            "- 'help': user asks what they can do or asks for examples.\n"
+            "- 'general_response': user asks about OneHealth capabilities or workflow, "
+            "without requesting a booking or storage.\n"
+            "- 'unsupported': message is unclear or outside OneHealth capabilities.\n\n"
+            "Return intent, confidence from 0.0 to 1.0, and a short reason. "
+            "Do not classify casual questions as user_info unless the user asked "
+            "to remember, save, or update specific profile data."
+        )
+        classifier = _model().with_structured_output(TextClassification)
+        classification = classifier.invoke([
+            SystemMessage(content=system),
+            HumanMessage(content=msg["user_message_content"]),
+        ])
 
-    next_node = (
-        "draft_appointment_details"
-        if classification["intent"] == "appointment"
-        else "draft_user_info_storage_details"
-    )
+    classification = {
+        "intent": classification["intent"],
+        "confidence": float(classification.get("confidence", 1.0)),
+        "reason": classification.get("reason", ""),
+    }
+    intent = classification["intent"]
+    if classification["confidence"] < 0.55:
+        intent = "unsupported"
+        classification = {**classification, "intent": intent}
+
+    if intent == "appointment":
+        next_node = "draft_appointment_details"
+    elif intent == "user_info":
+        next_node = "draft_user_info_storage_details"
+    elif intent == "location_update" and msg.get("location"):
+        next_node = "store_user_location"
+    elif intent == "location_update":
+        next_node = "request_user_location"
+    else:
+        next_node = "send_direct_response"
+
+    update = {
+        "user_message_content": msg["user_message_content"],
+        "user_location": msg.get("location"),
+        "user_message_classification": classification,
+        "update_id": msg.get("update_id"),
+        "classify_current_message": False,
+    }
+    if intent == "location_update" and not msg.get("location"):
+        update["location_request_reason"] = "add_location"
 
     return Command(
-        update={
-            "user_message_content": msg["user_message_content"],
-            "user_message_classification": classification,
-            "update_id": msg["update_id"],
-            "classify_current_message": False,
-        },
+        update=update,
         goto=next_node,
     )
+
+
+def store_user_location(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """Store a top-level Telegram location payload and end the turn."""
+    location = state.get("user_location")
+    if location:
+        store_info.invoke({"chat_id": state["chat_id"], "location": location})
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": location_added_text(bool(location)),
+        "remove_keyboard": True,
+    })
+    return Command(update={"location_request_reason": None}, goto=END)
+
+
+def send_direct_response(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """Send side-effect-free replies for non-workflow messages."""
+    intent = (state.get("user_message_classification") or {}).get("intent")
+    text = state.get("user_message_content", "")
+
+    if is_cancel_text(text):
+        response = cancelled_text()
+    elif intent == "greeting":
+        response = greeting_text()
+    elif intent == "about_assistant":
+        response = about_assistant_text()
+    elif intent == "help":
+        response = help_text()
+    elif _needs_medical_advice_redirect(text):
+        response = medical_advice_redirect_text()
+    elif intent == "general_response":
+        response = _model().invoke([
+            SystemMessage(content=(
+                "You are OneHealth, a Telegram assistant for healthcare appointment scheduling. "
+                "You can help book appointments through supported clinics and remember user "
+                "info only after explicit confirmation. You cannot give medical diagnosis or "
+                "treatment advice, claim booking is complete unless the booking workflow "
+                "succeeded, store info without confirmation, or invent clinic availability. "
+                "Keep replies short and offer one useful next action."
+            )),
+            HumanMessage(content=text),
+        ]).content
+    else:
+        response = unsupported_text()
+
+    send_message.invoke({"chat_id": state["chat_id"], "text": response, "remove_keyboard": True})
+    return Command(update={"direct_response": response}, goto=END)
 
 def draft_appointment_details(
     state: OneHealthAgentState,

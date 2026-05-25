@@ -6,12 +6,15 @@ OneHealth is a LangGraph healthcare scheduling agent that runs through Telegram.
 
 ```text
 Telegram message
-  -> start_thread
-  -> first-time location/onboarding when needed
+  -> receive_message
+  -> ensure_user
   -> classify_intent
-  -> confirmation/correction loop
-  -> appointment booking OR preference storage
+  -> direct response OR confirmation/correction loop
+  -> appointment booking OR preference storage OR location update
 ```
+
+First contact creates a minimal Supabase user row only. Location and patient
+details are collected just-in-time inside workflows that need them.
 
 Appointment booking path:
 

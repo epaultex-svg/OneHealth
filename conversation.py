@@ -126,6 +126,42 @@ def onboarding_ready_text() -> str:
     return "What can I help schedule or remember?"
 
 
+def greeting_text() -> str:
+    return (
+        "Hi. I can help book healthcare appointments and remember info you confirm. "
+        "Try: Book a dentist next Tuesday, or Remember my insurance is Aetna."
+    )
+
+
+def about_assistant_text() -> str:
+    return (
+        "I am OneHealth, a Telegram assistant for healthcare appointment scheduling. "
+        "I can book through supported clinics and remember confirmed details like "
+        "insurance. I ask before storing info or booking."
+    )
+
+
+def help_text() -> str:
+    return (
+        "I can help with appointments, confirmed profile details, and location updates. "
+        "Examples: Book a filling tomorrow, Remember my insurance is Aetna, or /add_location."
+    )
+
+
+def unsupported_text() -> str:
+    return (
+        "I can help book healthcare appointments or remember details you confirm. "
+        "Try asking to book an appointment, update insurance, or add location."
+    )
+
+
+def medical_advice_redirect_text() -> str:
+    return (
+        "I cannot give medical advice or diagnose symptoms. Contact a clinician for "
+        "medical guidance; if this feels urgent, call emergency services."
+    )
+
+
 def patient_privacy_text() -> str:
     return (
         "Before I can book, I need the patient's name, date of birth, email, "
