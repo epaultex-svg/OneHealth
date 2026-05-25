@@ -24,7 +24,7 @@ Defined in `tools.py`:
 | Tool | Purpose | Current Graph Usage |
 |------|---------|---------------------|
 | `read_message()` | Reads latest inbound Telegram message | Used by intake and interrupt resume helpers |
-| `send_message()` | Sends Telegram messages, location request keyboards, and keyboard removal | Used throughout user-facing flow |
+| `send_message()` | Sends Telegram messages, location request keyboards, text reply buttons, and keyboard removal | Used throughout user-facing flow |
 | `store_info()` | Upserts user profile data, location, patient IDs, and appointment records in Supabase | Used by onboarding, preference storage, patient cache, and booking |
 | `firecrawl_search()` | Legacy healthcare website search helper | Present but not wired into current NexHealth graph |
 
@@ -41,6 +41,8 @@ Defined in `state.py`:
 | `user_message_content` | `str` | Latest inbound user text | Yes |
 | `user_location` | `dict \| None` | Telegram location payload | Yes |
 | `location_request_reason` | `"new_user" \| "add_location" \| None` | Distinguishes first-time onboarding from explicit location update | Yes |
+| `classify_current_message` | `bool` | Lets webhook-seeded messages skip an extra interrupt | Yes |
+| `conversation_status` | `"active" \| "cancelled" \| None` | Marks user-cancelled flows | Yes |
 | `username` | `str` | Telegram username or user nickname | No |
 | `message_history` | `list[str]` | Optional conversation history | No |
 | `user_message_classification` | `TextClassification \| None` | Immutable intent classification for downstream routing | Yes |
@@ -57,8 +59,24 @@ Defined in `state.py`:
 | `nexhealth_selected_slot` | `NexHealthSlot \| None` | User-selected slot for booking | Yes |
 | `book_appointment_result` | `dict \| None` | Raw booking result for compatibility | No |
 | `nexhealth_appointment_result` | `dict \| None` | Raw NexHealth appointment response | No |
+| `appointment_booking_key` | `str \| None` | Idempotency key for normalized appointment writes | Yes |
+| `appointment_booking_status` | `str \| None` | Booking state from normalized appointment table | Yes |
 | `user_info_draft` | `str` | Confirmation copy for stored user info | Yes |
 | `user_info_extracted` | `UserInfoExtracted \| None` | Structured profile fields to persist after confirmation | Yes |
+
+## Conversation Design
+
+User-facing copy and state rules live in `conversation.py`.
+
+| Area | Design Rule |
+|------|-------------|
+| State coverage | `CONVERSATION_STATE_TABLE` defines loading, empty, error, success, retry, and cancel behavior for each user-facing step |
+| Privacy | Patient demographics and profile storage explain why data is needed before asking or storing |
+| Confirmation | Appointment and profile writes use Yes / Change / Cancel buttons |
+| Choice UI | Provider, appointment type, and slot choices use Telegram reply buttons plus numeric fallback |
+| Retry | Invalid provider/type/slot replies send a specific retry message and do not advance |
+| Cancel | `Cancel` stops before scheduling, storage, patient lookup, or booking, depending on current step |
+| Empty results | No providers/types/slots give recovery actions instead of dead-end copy |
 
 ## Nodes
 
@@ -69,15 +87,15 @@ Defined in `nodes.py` and wired in `agent.py`:
 - `start_thread`: Reads or resumes latest Telegram message, creates missing Supabase user row, routes first-time users to location request.
 - `request_user_location`: Sends Telegram location request keyboard.
 - `await_user_location`: Waits for location reply, stores location when provided, removes keyboard, then routes to onboarding or classification.
-- `onboard`: Collects required patient demographics for NexHealth scheduling and stores them.
+- `onboard`: Shows privacy copy, collects required patient demographics for NexHealth scheduling, and stores them unless user cancels.
 
 ### Intent and Confirmation
 
 - `classify_intent`: Classifies message as `appointment` or `user_info`.
 - `draft_appointment_details`: Extracts appointment details and builds confirmation copy.
 - `draft_user_info_storage_details`: Extracts supported profile fields and builds confirmation copy.
-- `send_user_confirmation`: Sends current draft confirmation.
-- `interpret_user_confirmation`: Routes confirmed requests to booking/storage and denied requests to correction.
+- `send_user_confirmation`: Sends current draft confirmation with Yes / Change / Cancel buttons.
+- `interpret_user_confirmation`: Routes confirmed requests to booking/storage, denied requests to correction, and cancellation to `END`.
 - `send_correction_query`: Asks what to fix.
 - `correct_info`: Applies user corrections, updates structured state, and re-confirms.
 
@@ -90,15 +108,15 @@ Defined in `nodes.py` and wired in `agent.py`:
 - `start_nexhealth_scheduling`: Sends progress message before API work begins.
 - `get_location`: Uses `NEXHEALTH_LOCATION_ID` when configured, otherwise fetches/selects active NexHealth location.
 - `get_provider`: Fetches requestable providers and auto-matches or asks user to choose.
-- `send_provider_options`: Sends provider choices over Telegram.
-- `select_provider`: Parses user provider selection.
+- `send_provider_options`: Sends provider choices over Telegram with reply buttons.
+- `select_provider`: Parses user provider selection, retries invalid choices, or cancels.
 - `get_patient`: Merges stored patient info, collects missing fields, finds or creates NexHealth patient, then stores patient ID.
 - `get_appointment_type`: Fetches appointment types and auto-matches or asks user to choose.
-- `send_appointment_type_options`: Sends appointment type choices over Telegram.
-- `select_appointment_type`: Parses user appointment type selection.
+- `send_appointment_type_options`: Sends appointment type choices over Telegram with reply buttons.
+- `select_appointment_type`: Parses user appointment type selection, retries invalid choices, or cancels.
 - `get_appointment_slots`: Fetches available slots, follows next available date when provided, and stores top options.
-- `send_slot_options`: Sends slot choices over Telegram.
-- `select_appointment_slot`: Parses user slot selection and reprompts on invalid choices.
+- `send_slot_options`: Sends slot choices over Telegram with reply buttons.
+- `select_appointment_slot`: Parses user slot selection, retries invalid choices, or cancels before booking.
 - `book_appointment`: Books appointment in NexHealth, stores appointment record in Supabase, and sends final Telegram confirmation.
 
 ## External APIs and Services
@@ -116,13 +134,14 @@ Defined in `nodes.py` and wired in `agent.py`:
 - Appointment booking now uses NexHealth API calls directly instead of Firecrawl search, Browserbase cookies, or Stagehand browser automation.
 - Location is optional for booking when `NEXHEALTH_LOCATION_ID` is configured, but first-time users are still asked for location to improve future results.
 - NexHealth patient demographics are collected before scheduling because booking requires patient identity fields.
-- Provider, appointment type, and slot selection support both numeric choices and record/ID matching.
-- Empty NexHealth results currently end the flow with a Telegram message; future UX should offer recovery actions such as changing date, provider, location, or appointment type.
+- Provider, appointment type, and slot selection support Telegram buttons, numeric choices, and record/ID matching.
+- Empty NexHealth results end safely and tell users what to try next: another date, provider, appointment type, location, or cancellation.
+- Eval runs capture outbound Telegram messages so copy, privacy, button, retry, and cancel behavior can be scored.
 
 ## Evaluation
 
 Trajectory evaluation lives in `evals/`:
 
-- `evals/run_onehealth_langsmith_eval.py`: Runs graph against dataset examples and records node trajectory/final state.
-- `evals/onehealth_evaluators.py`: Deterministic evaluators for trajectory matching and expected state subset matching.
-- `OneHealth_test_dataset.csv`: Scenario coverage for onboarding, location decline, corrections, provider/type selection, no slots, invalid slot retry, and preference storage.
+- `evals/run_onehealth_langsmith_eval.py`: Runs graph against dataset examples and records node trajectory, final state, and captured outbound messages.
+- `evals/onehealth_evaluators.py`: Deterministic evaluators for trajectory matching, expected state subset matching, and UX assertions.
+- `OneHealth_test_dataset.csv`: Scenario coverage for onboarding, location decline, corrections, provider/type selection, no slots, invalid slot retry, cancellation, privacy copy, reply buttons, and preference storage.

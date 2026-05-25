@@ -1,6 +1,8 @@
 import pytest
 
+import conversation
 import nodes
+from evals.onehealth_evaluators import user_experience_assertions_evaluator
 
 
 class FakeStructured:
@@ -22,6 +24,23 @@ class FakeTool:
 
     def invoke(self, payload):
         return self.fn(payload)
+
+
+def test_conversation_state_table_covers_user_facing_steps():
+    steps = {row["step"] for row in conversation.CONVERSATION_STATE_TABLE}
+
+    assert {
+        "location_request",
+        "patient_info",
+        "appointment_confirmation",
+        "profile_confirmation",
+        "provider_selection",
+        "appointment_type_selection",
+        "slot_selection",
+        "booking",
+    }.issubset(steps)
+    for row in conversation.CONVERSATION_STATE_TABLE:
+        assert all(row[state] for state in ("loading", "empty", "error", "success", "retry", "cancel"))
 
 
 def test_normalize_resume_message_preserves_webhook_metadata():
@@ -121,6 +140,7 @@ def test_send_provider_options_shows_provider_names_only(monkeypatch):
     assert command.goto == "select_provider"
     assert "1. Jonas Salk" in sent[-1]["text"]
     assert "2. Albert Einstein" in sent[-1]["text"]
+    assert sent[-1]["keyboard"] == [["1. Jonas Salk"], ["2. Albert Einstein"], ["Cancel"]]
     assert "ID" not in sent[-1]["text"]
     assert "488169621" not in sent[-1]["text"]
 
@@ -145,6 +165,7 @@ def test_send_appointment_type_options_shows_titles_only(monkeypatch):
     assert command.goto == "select_appointment_type"
     assert "1. Filling" in sent[-1]["text"]
     assert "2. Extraction" in sent[-1]["text"]
+    assert sent[-1]["keyboard"] == [["1. Filling"], ["2. Extraction"], ["Cancel"]]
     assert "Fallback name" not in sent[-1]["text"]
     assert "ID" not in sent[-1]["text"]
     assert "1201033" not in sent[-1]["text"]
@@ -169,10 +190,109 @@ def test_send_slot_options_formats_times_without_slot_metadata(monkeypatch):
 
     assert command.goto == "select_appointment_slot"
     assert "1. Tuesday, May 26 at 9:00 AM" in sent[-1]["text"]
+    assert sent[-1]["keyboard"] == [["1. Tuesday, May 26 at 9:00 AM"], ["Cancel"]]
     assert "2026-05-26T09:00:00.000-04:00" not in sent[-1]["text"]
     assert "provider" not in sent[-1]["text"]
     assert "operatory" not in sent[-1]["text"]
     assert "270235" not in sent[-1]["text"]
+
+
+def test_collect_patient_info_shows_privacy_copy_and_honors_cancel(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: {"text": "cancel", "update_id": 20})
+
+    result = nodes._collect_patient_info({"chat_id": "888"})
+
+    assert result is None
+    assert "Before I can book" in sent[0]["text"]
+    assert sent[-1]["text"].startswith("Cancelled")
+
+
+def test_interpret_user_confirmation_cancel_stops_before_side_effects(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: {"text": "cancel", "update_id": 21})
+
+    command = nodes.interpret_user_confirmation(
+        {
+            "chat_id": "888",
+            "user_message_classification": {"intent": "appointment"},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert command.update["conversation_status"] == "cancelled"
+    assert sent[-1]["remove_keyboard"] is True
+
+
+def test_select_provider_invalid_choice_reprompts_then_cancel(monkeypatch):
+    sent = []
+    replies = iter([
+        {"text": "not that one", "update_id": 30},
+        {"text": "cancel", "update_id": 31},
+    ])
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: next(replies))
+
+    command = nodes.select_provider(
+        {
+            "chat_id": "888",
+            "nexhealth_provider_options": [
+                {"id": 1, "label": "Jonas Salk", "record": {"id": 1, "name": "Jonas Salk"}}
+            ],
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert command.update["conversation_status"] == "cancelled"
+    assert any("I did not recognize that provider" in message["text"] for message in sent)
+
+
+def test_get_appointment_slots_empty_result_offers_recovery(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "_nexhealth_request", lambda *args, **kwargs: ({"data": []}, {}))
+
+    command = nodes.get_appointment_slots(
+        {
+            "chat_id": "888",
+            "nexhealth_location_id": 1,
+            "nexhealth_provider_id": 2,
+            "nexhealth_appointment_type_id": 3,
+            "appt_details": {"Date": "2026-05-26"},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert "try another date" in sent[-1]["text"]
+    assert "different provider" in sent[-1]["text"]
+
+
+def test_user_experience_evaluator_scores_declared_assertions():
+    run = {
+        "outputs": {
+            "trajectory": ["start_thread", "get_appointment_slots", "__end__"],
+            "final_state": {"conversation_status": "cancelled"},
+            "messages": [
+                {"text": "I could not find open slots. You can try another date, choose a different provider or appointment type, or reply Cancel."},
+                {"text": "I did not recognize that slot.", "keyboard": [["1. Tuesday"], ["Cancel"]]},
+            ],
+        }
+    }
+    example = {
+        "outputs": {
+            "expected_result": {
+                "ux_assertions": {
+                    "no_slot_recovery": True,
+                    "invalid_choice_retry": True,
+                    "telegram_buttons": True,
+                }
+            }
+        }
+    }
+
+    assert user_experience_assertions_evaluator(run, example)["score"] == 1
 
 
 def test_book_appointment_skips_nexhealth_when_booking_already_booked(monkeypatch):

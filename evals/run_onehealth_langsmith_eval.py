@@ -3,8 +3,8 @@
 This runner executes the LangGraph agent, feeds each example's resume_sequence,
 and returns outputs shaped for evals/onehealth_evaluators.py.
 
-Live runs can send Telegram messages, write Supabase rows, and book NexHealth
-appointments. The CLI requires --allow-side-effects before it calls evaluate().
+Live runs capture Telegram messages, but can still write Supabase rows and book
+NexHealth appointments. The CLI requires --allow-side-effects before evaluate().
 """
 
 from __future__ import annotations
@@ -23,14 +23,30 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 from langsmith import evaluate
 
+import nodes as graph_nodes
 from agent import build_graph
 from evals.onehealth_evaluators import (
     expected_state_match_evaluator,
     trajectory_match_evaluator,
+    user_experience_assertions_evaluator,
 )
 
 
 DEFAULT_DATASET_NAME = "OneHealth Trajectory Dataset"
+
+
+class RecordingSendMessage:
+    def __init__(self, messages: list[dict[str, Any]]):
+        self.messages = messages
+
+    def invoke(self, payload: dict[str, Any]) -> dict[str, Any]:
+        message = dict(payload)
+        self.messages.append(message)
+        return {
+            "chat_id": str(payload.get("chat_id", "")),
+            "outbound_message_content": str(payload.get("text", "")),
+            "message_thread_id": None,
+        }
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -153,6 +169,7 @@ def run_onehealth_agent(inputs: dict[str, Any]) -> dict[str, Any]:
     trajectory: list[str] = []
     seen_task_ids: set[str] = set()
     interrupted_nodes: list[str] = []
+    messages: list[dict[str, Any]] = []
     errors: list[str] = []
     finished = False
     final_state: dict[str, Any] = {}
@@ -160,51 +177,56 @@ def run_onehealth_agent(inputs: dict[str, Any]) -> dict[str, Any]:
     thread_id = f"eval-{example_id}-{uuid.uuid4()}"
     config = {"configurable": {"thread_id": thread_id}}
 
-    with _env_overrides(env_overrides):
-        graph = build_graph(InMemorySaver())
-        try:
-            interrupted_at, finished, _ = _consume_debug_stream(
-                graph,
-                initial_state,
-                config,
-                trajectory,
-                seen_task_ids,
-                errors,
-            )
-            if interrupted_at:
-                interrupted_nodes.append(interrupted_at)
-
-            for entry in resume_sequence:
-                expected_resume_node = entry.get("node") if isinstance(entry, dict) else None
-                interrupted_at, finished, appended = _consume_debug_stream(
+    original_send_message = graph_nodes.send_message
+    graph_nodes.send_message = RecordingSendMessage(messages)
+    try:
+        with _env_overrides(env_overrides):
+            graph = build_graph(InMemorySaver())
+            try:
+                interrupted_at, finished, _ = _consume_debug_stream(
                     graph,
-                    Command(resume=_resume_payload(_as_dict(entry))),
+                    initial_state,
                     config,
                     trajectory,
                     seen_task_ids,
                     errors,
                 )
-
-                if (
-                    expected_resume_node
-                    and interrupted_at == expected_resume_node
-                    and expected_resume_node not in appended
-                ):
-                    trajectory.append(str(expected_resume_node))
-
                 if interrupted_at:
                     interrupted_nodes.append(interrupted_at)
 
-                if finished:
-                    break
+                for entry in resume_sequence:
+                    expected_resume_node = entry.get("node") if isinstance(entry, dict) else None
+                    interrupted_at, finished, appended = _consume_debug_stream(
+                        graph,
+                        Command(resume=_resume_payload(_as_dict(entry))),
+                        config,
+                        trajectory,
+                        seen_task_ids,
+                        errors,
+                    )
 
-            final_state = dict(graph.get_state(config).values)
-        except Exception as exc:  # LangSmith should record compareable outputs.
-            errors.append(f"{type(exc).__name__}: {exc}")
-            try:
+                    if (
+                        expected_resume_node
+                        and interrupted_at == expected_resume_node
+                        and expected_resume_node not in appended
+                    ):
+                        trajectory.append(str(expected_resume_node))
+
+                    if interrupted_at:
+                        interrupted_nodes.append(interrupted_at)
+
+                    if finished:
+                        break
+
                 final_state = dict(graph.get_state(config).values)
-            except Exception:
-                final_state = {}
+            except Exception as exc:  # LangSmith should record compareable outputs.
+                errors.append(f"{type(exc).__name__}: {exc}")
+                try:
+                    final_state = dict(graph.get_state(config).values)
+                except Exception:
+                    final_state = {}
+    finally:
+        graph_nodes.send_message = original_send_message
 
     if finished and (not trajectory or trajectory[-1] != "__end__"):
         trajectory.append("__end__")
@@ -213,6 +235,7 @@ def run_onehealth_agent(inputs: dict[str, Any]) -> dict[str, Any]:
         "example_id": example_id,
         "trajectory": trajectory,
         "final_state": _json_safe(final_state),
+        "messages": _json_safe(messages),
         "interrupted_nodes": interrupted_nodes,
         "errors": errors,
         "finished": finished,
@@ -235,6 +258,7 @@ def _local_smoke(path: Path, limit: int) -> None:
         result = {
             "trajectory_match": trajectory_match_evaluator(run, example),
             "expected_state_match": expected_state_match_evaluator(run, example),
+            "user_experience_assertions": user_experience_assertions_evaluator(run, example),
         }
         print(json.dumps({"id": example.get("id"), "outputs": outputs, "scores": result}, indent=2))
 
@@ -265,7 +289,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-side-effects",
         action="store_true",
-        help="Required. Evaluation may send messages, write Supabase data, and book appointments.",
+        help="Required. Evaluation captures messages, but may write Supabase data and book appointments.",
     )
     args = parser.parse_args()
 
@@ -279,7 +303,11 @@ def main() -> None:
     evaluate(
         run_onehealth_agent,
         data=args.dataset,
-        evaluators=[trajectory_match_evaluator, expected_state_match_evaluator],
+        evaluators=[
+            trajectory_match_evaluator,
+            expected_state_match_evaluator,
+            user_experience_assertions_evaluator,
+        ],
         experiment_prefix=args.experiment_prefix,
         max_concurrency=1,
     )

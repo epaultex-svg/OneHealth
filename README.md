@@ -46,6 +46,7 @@ draft_user_info_storage_details
 | `agent.py` | Builds and compiles the LangGraph workflow |
 | `nodes.py` | Node implementations, LLM prompts, NexHealth helpers, Telegram-facing flow |
 | `state.py` | Shared graph state schema and structured output types |
+| `conversation.py` | Centralized user-facing copy, reply button helpers, and conversation state table |
 | `tools.py` | Telegram, Supabase, and legacy Firecrawl tool wrappers |
 | `langgraph.json` | LangGraph Studio graph config |
 | `evals/` | LangSmith trajectory runner and deterministic evaluators |
@@ -130,15 +131,33 @@ uv run python -m evals.run_onehealth_langsmith_eval \
   --allow-side-effects
 ```
 
-Important: evaluation uses real graph code. Live runs can send Telegram messages, write Supabase rows, create NexHealth patients, and book appointments. Use `--allow-side-effects` only when those effects are intended.
+Important: evaluation uses real graph code. The runner captures outbound Telegram messages for scoring instead of sending them, but live runs can still write Supabase rows, create NexHealth patients, and book appointments. Use `--allow-side-effects` only when those effects are intended.
+
+## Conversation State Coverage
+
+`conversation.py` defines the user-facing state contract. Every major step has loading, empty, error, success, retry, and cancel behavior:
+
+| Step | Loading | Empty | Error | Success | Retry | Cancel |
+|------|---------|-------|-------|---------|-------|--------|
+| Location request | Ask Telegram for location permission | Continue without location | Continue if storage fails | Store location | `/add_location` later | Stop onboarding |
+| Patient info | Explain why demographics are needed | List missing fields | Ask for field-specific retry | Store complete demographics | Ask only for remaining fields | Stop before patient write |
+| Appointment confirmation | Draft extracted details | Show `not specified` | Ask what to change | Proceed to scheduling | Re-confirm corrected draft | Stop before booking |
+| Profile confirmation | Extract supported fields | Store nothing | Ask what to change | Store confirmed fields | Re-confirm corrected draft | Stop before Supabase write |
+| Provider selection | Fetch requestable providers | Suggest changing location/request | Reject invalid choice | Store provider ID | Send buttons again | Stop before patient lookup |
+| Appointment type selection | Fetch appointment types | Suggest changing reason/request | Reject invalid choice | Store type ID | Send buttons again | Stop before slot search |
+| Slot selection | Search available slots | Suggest another date/provider/type | Reject invalid choice | Store selected slot | Send buttons again | Stop before booking |
+| Booking | Reserve booking key | Guard against missing slot | Mark booking failure | Confirm readable time | Reuse existing booking status | Cancel unavailable after booking starts |
 
 ## User Experience Notes
 
 - Every appointment and profile update goes through a confirmation prompt before write or booking.
 - Users can deny confirmation, describe corrections, and review updated details.
-- Provider, appointment type, and slot pickers accept numeric replies and some record/ID matches.
-- Empty NexHealth results currently end the flow with a message. Better recovery actions should be added: change date, choose provider, broaden search, or call office.
-- Patient demographics, location, and insurance are sensitive. Any production-facing flow should explain why data is needed and how users can update or delete it.
+- Patient demographics and profile storage include privacy/consent copy before asking or storing.
+- Provider, appointment type, and slot pickers send Telegram reply buttons and still accept numeric replies plus some record/ID matches.
+- Invalid provider/type/slot replies send a specific retry message and do not advance.
+- Users can reply `Cancel` during confirmation, correction, patient-info collection, provider/type selection, or slot selection. Cancellation stops before side effects for that step.
+- Empty NexHealth results end safely with recovery actions: try another date, choose a different provider or appointment type, change request, or cancel.
+- Patient demographics, location, and insurance are sensitive. Production should also expose update/delete controls.
 
 ## Telegram Webhook
 
@@ -200,7 +219,9 @@ uv run pytest
 ```
 
 The test suite covers webhook parsing/security/dedupe, worker run/resume
-routing, seeded-message graph regression, and appointment booking idempotency.
+routing, seeded-message graph regression, appointment booking idempotency,
+conversation state coverage, privacy copy, cancel flow, invalid-choice retry,
+no-slot recovery copy, Telegram buttons, and UX assertion scoring.
 
 ## Legacy Notes
 

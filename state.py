@@ -53,6 +53,7 @@ class OneHealthAgentState(TypedDict, total=False):
     user_location: dict | None
     location_request_reason: Literal["new_user", "add_location"] | None
     classify_current_message: bool
+    conversation_status: Literal["active", "cancelled"] | None
     username: str
     message_history: list[str]
     user_message_classification: TextClassification | None
