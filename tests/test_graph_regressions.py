@@ -101,6 +101,80 @@ def _booking_state():
     }
 
 
+def test_send_provider_options_shows_provider_names_only(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_provider_options(
+        {
+            "chat_id": "888",
+            "nexhealth_provider_options": nodes._choice_options(
+                [
+                    {"id": 488169621, "name": "Jonas Salk"},
+                    {"id": 488169622, "first_name": "Albert", "last_name": "Einstein"},
+                ],
+                nodes._provider_label,
+            ),
+        }
+    )
+
+    assert command.goto == "select_provider"
+    assert "1. Jonas Salk" in sent[-1]["text"]
+    assert "2. Albert Einstein" in sent[-1]["text"]
+    assert "ID" not in sent[-1]["text"]
+    assert "488169621" not in sent[-1]["text"]
+
+
+def test_send_appointment_type_options_shows_titles_only(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_appointment_type_options(
+        {
+            "chat_id": "888",
+            "nexhealth_appointment_type_options": nodes._choice_options(
+                [
+                    {"id": 1201033, "title": "Filling", "name": "Fallback name"},
+                    {"id": 1201034, "name": "Extraction"},
+                ],
+                nodes._appointment_type_label,
+            ),
+        }
+    )
+
+    assert command.goto == "select_appointment_type"
+    assert "1. Filling" in sent[-1]["text"]
+    assert "2. Extraction" in sent[-1]["text"]
+    assert "Fallback name" not in sent[-1]["text"]
+    assert "ID" not in sent[-1]["text"]
+    assert "1201033" not in sent[-1]["text"]
+
+
+def test_send_slot_options_formats_times_without_slot_metadata(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_slot_options(
+        {
+            "chat_id": "888",
+            "nexhealth_available_slots": [
+                {
+                    "time": "2026-05-26T09:00:00.000-04:00",
+                    "operatory_id": 270235,
+                    "provider_id": 488169621,
+                }
+            ],
+        }
+    )
+
+    assert command.goto == "select_appointment_slot"
+    assert "1. Tuesday, May 26 at 9:00 AM" in sent[-1]["text"]
+    assert "2026-05-26T09:00:00.000-04:00" not in sent[-1]["text"]
+    assert "provider" not in sent[-1]["text"]
+    assert "operatory" not in sent[-1]["text"]
+    assert "270235" not in sent[-1]["text"]
+
+
 def test_book_appointment_skips_nexhealth_when_booking_already_booked(monkeypatch):
     sent = []
     monkeypatch.setattr(
@@ -125,6 +199,8 @@ def test_book_appointment_skips_nexhealth_when_booking_already_booked(monkeypatc
     assert command.goto == nodes.END
     assert command.update["appointment_booking_status"] == "booked"
     assert sent[-1]["text"].startswith("Booked your appointment")
+    assert "Tuesday, May 26 at 9:00 AM" in sent[-1]["text"]
+    assert "2026-05-26T09:00:00-04:00" not in sent[-1]["text"]
 
 
 def test_book_appointment_marks_normalized_booking_success(monkeypatch):
@@ -161,3 +237,5 @@ def test_book_appointment_marks_normalized_booking_success(monkeypatch):
     assert command.update["appointment_booking_status"] == "booked"
     assert marked[0]["nexhealth_appointment_id"] == "12345"
     assert sent[-1]["text"].startswith("Booked your appointment")
+    assert "Tuesday, May 26 at 9:00 AM" in sent[-1]["text"]
+    assert "2026-05-26T09:00:00-04:00" not in sent[-1]["text"]
