@@ -49,7 +49,6 @@ from conversation import (
     location_skipped_text,
     greeting_text,
     help_text,
-    medical_advice_redirect_text,
     no_appointment_types_text,
     no_locations_text,
     no_providers_text,
@@ -61,7 +60,6 @@ from conversation import (
     profile_confirmation_text,
     saved_text,
     scheduling_loading_text,
-    unsupported_text,
 )
 from tools import (
     read_message,
@@ -875,6 +873,46 @@ def _normalized_text(text: object) -> str:
     return " ".join(str(text or "").strip().lower().split())
 
 
+def _is_general_response_phrase(text: str) -> bool:
+    stripped = text.strip(" \t\n\r.!?")
+    if not stripped:
+        return True
+
+    acknowledgements = {
+        "ok",
+        "okay",
+        "k",
+        "cool",
+        "great",
+        "awesome",
+        "perfect",
+        "sounds good",
+        "thank you",
+        "thanks",
+        "thx",
+        "ty",
+        "you are welcome",
+        "you're welcome",
+        "no problem",
+        "no worries",
+    }
+    small_talk_prefixes = (
+        "how are you",
+        "how are things",
+        "how is it going",
+        "how's it going",
+        "how have you been",
+        "hope you are",
+        "hope you're",
+        "nice to meet you",
+        "good to hear",
+        "glad to hear",
+        "i appreciate",
+    )
+
+    return stripped in acknowledgements or stripped.startswith(small_talk_prefixes)
+
+
 def _deterministic_classification(msg: dict[str, Any]) -> TextClassification | None:
     text = _normalized_text(msg.get("user_message_content"))
     if msg.get("location"):
@@ -901,23 +939,11 @@ def _deterministic_classification(msg: dict[str, Any]) -> TextClassification | N
         "what are you",
     }:
         return {"intent": "about_assistant", "confidence": 1.0, "reason": "about_phrase"}
+    if _is_general_response_phrase(text):
+        return {"intent": "general_response", "confidence": 1.0, "reason": "small_talk_or_acknowledgement"}
     if is_cancel_text(text):
-        return {"intent": "unsupported", "confidence": 1.0, "reason": "top_level_cancel"}
+        return {"intent": "general_response", "confidence": 1.0, "reason": "top_level_cancel"}
     return None
-
-
-def _needs_medical_advice_redirect(text: str) -> bool:
-    normalized = _normalized_text(text)
-    advice_markers = (
-        "diagnose",
-        "symptom",
-        "symptoms",
-        "should i take",
-        "what medicine",
-        "medical advice",
-        "is this serious",
-    )
-    return any(marker in normalized for marker in advice_markers)
 
 def classify_intent(
     state: OneHealthAgentState,
@@ -951,16 +977,35 @@ def classify_intent(
     if classification is None:
         system = (
             "Classify the user's message into exactly one intent:\n"
-            "- 'appointment': user wants to book, reschedule, or cancel a healthcare appointment.\n"
+            "- 'appointment': user asks OneHealth to take an appointment action now: "
+            "arrange, book, schedule, make, create, reserve, move, reschedule, cancel, "
+            "or otherwise change a specific appointment or visit. Generalize from "
+            "these examples by looking for directive scheduling intent, not just "
+            "appointment-related nouns.\n"
             "- 'user_info': user explicitly wants to store preferences, profile data, "
             "insurance, contact info, or other context for future use.\n"
             "- 'location_update': user wants to add, update, or share location.\n"
-            "- 'greeting': brief greeting only.\n"
+            "- 'greeting': standalone salutation only, such as a brief hello with "
+            "no small-talk question or workflow request.\n"
             "- 'about_assistant': user asks what OneHealth is or asks about the assistant.\n"
             "- 'help': user asks what they can do or asks for examples.\n"
-            "- 'general_response': user asks about OneHealth capabilities or workflow, "
-            "without requesting a booking or storage.\n"
-            "- 'unsupported': message is unclear or outside OneHealth capabilities.\n\n"
+            "- 'general_info': user asks about OneHealth capabilities or workflow, "
+            "or whether OneHealth can help with a specialty, service, or appointment "
+            "category, without asking OneHealth to actually arrange, change, or cancel "
+            "one now. Capability verbs like help, assist, support, handle, explain, "
+            "or similar inquiry wording should route here when the user is asking "
+            "what OneHealth can do.\n"
+            "- 'general_response': any other conversational message, including thanks, "
+            "polite acknowledgements, small talk, social check-ins, unclear text, "
+            "or messages outside OneHealth workflows.\n\n"
+            "Tie-breakers:\n"
+            "- If the message mentions appointments but asks a capability question "
+            "such as whether OneHealth can help or assist with that kind of care, "
+            "choose 'general_info'.\n"
+            "- If the message asks the assistant to perform the scheduling action "
+            "now, choose 'appointment'.\n"
+            "- If the message is social small talk, a thanks, an acknowledgement, "
+            "or a pleasantry, choose 'general_response', not 'greeting'.\n\n"
             "Return intent, confidence from 0.0 to 1.0, and a short reason. "
             "Do not classify casual questions as user_info unless the user asked "
             "to remember, save, or update specific profile data."
@@ -978,7 +1023,7 @@ def classify_intent(
     }
     intent = classification["intent"]
     if classification["confidence"] < 0.55:
-        intent = "unsupported"
+        intent = "general_response"
         classification = {**classification, "intent": intent}
 
     if intent == "appointment":
@@ -1026,17 +1071,13 @@ def send_direct_response(state: OneHealthAgentState) -> Command[Literal["__end__
     intent = (state.get("user_message_classification") or {}).get("intent")
     text = state.get("user_message_content", "")
 
-    if is_cancel_text(text):
-        response = cancelled_text()
-    elif intent == "greeting":
+    if intent == "greeting":
         response = greeting_text()
     elif intent == "about_assistant":
         response = about_assistant_text()
     elif intent == "help":
         response = help_text()
-    elif _needs_medical_advice_redirect(text):
-        response = medical_advice_redirect_text()
-    elif intent == "general_response":
+    else:
         response = _model().invoke([
             SystemMessage(content=(
                 "You are OneHealth, a Telegram assistant for healthcare appointment scheduling. "
@@ -1044,12 +1085,14 @@ def send_direct_response(state: OneHealthAgentState) -> Command[Literal["__end__
                 "info only after explicit confirmation. You cannot give medical diagnosis or "
                 "treatment advice, claim booking is complete unless the booking workflow "
                 "succeeded, store info without confirmation, or invent clinic availability. "
-                "Keep replies short and offer one useful next action."
+                "If the user asks about OneHealth capabilities or workflow, answer briefly "
+                "with what OneHealth can do. If the user says thanks, acknowledges a prior "
+                "message, asks small talk like how you are, or says something outside the "
+                "supported workflows, respond naturally and briefly without starting any "
+                "workflow. Offer one useful next action only when it fits the user's message."
             )),
             HumanMessage(content=text),
         ]).content
-    else:
-        response = unsupported_text()
 
     send_message.invoke({"chat_id": state["chat_id"], "text": response, "remove_keyboard": True})
     return Command(update={"direct_response": response}, goto=END)
