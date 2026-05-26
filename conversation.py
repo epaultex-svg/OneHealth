@@ -202,6 +202,30 @@ def profile_confirmation_text(extracted: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def insurance_lookup_text(insurance: dict[str, Any] | None) -> str:
+    if not insurance:
+        return (
+            "I do not have insurance saved yet. Please give me your provider, member ID, and group ID."
+        )
+
+    parts = []
+    if provider := insurance.get("provider"):
+        parts.append(f"provider: {provider}")
+    if member_id := insurance.get("member_id"):
+        parts.append(f"member ID: {member_id}")
+    if group_id := insurance.get("group_id"):
+        parts.append(f"group ID: {group_id}")
+
+    return "Insurance saved: " + (", ".join(parts) if parts else str(insurance))
+
+
+def insurance_update_missing_value_text() -> str:
+    return (
+        "Tell me the insurance details to save. "
+        "Example: Remember my insurance is Aetna, member ID 123, group ID ABC."
+    )
+
+
 def correction_prompt_text() -> str:
     return "What should I change? Reply with the correction, or Cancel."
 

@@ -293,6 +293,96 @@ def test_classify_intent_prompt_distinguishes_capability_from_booking(
     assert "social small talk" in system_prompt
 
 
+def test_classify_intent_routes_insurance_lookup_without_model(monkeypatch):
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("insurance lookup should be deterministic"))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: pytest.fail("should not interrupt seeded input"))
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": "What is my insurance?",
+            "classify_current_message": True,
+        }
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["user_message_classification"] == {
+        "intent": "general_info",
+        "confidence": 1.0,
+        "reason": "insurance_lookup",
+    }
+
+
+def test_classify_intent_routes_incomplete_insurance_update_without_model(monkeypatch):
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("incomplete insurance update should be deterministic"))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: pytest.fail("should not interrupt seeded input"))
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": "Can you update my insurance?",
+            "classify_current_message": True,
+        }
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["user_message_classification"] == {
+        "intent": "general_info",
+        "confidence": 1.0,
+        "reason": "insurance_update_missing_value",
+    }
+
+
+def test_send_direct_response_insurance_lookup_reads_supabase_without_model(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        nodes,
+        "create_client",
+        lambda *args, **kwargs: FakeSupabaseClient([
+            {"insurance": {"provider": "Aetna", "member_id": "TEST123", "group_id": "GRP9"}}
+        ]),
+    )
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("insurance lookup should not call model"))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_direct_response(
+        {
+            "chat_id": "888",
+            "user_message_content": "What is my insurance?",
+            "user_message_classification": {"intent": "general_info", "reason": "insurance_lookup"},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert "Aetna" in sent[-1]["text"]
+    assert "TEST123" in sent[-1]["text"]
+    assert "GRP9" in sent[-1]["text"]
+    assert sent[-1]["remove_keyboard"] is True
+
+
+def test_send_direct_response_incomplete_insurance_update_asks_for_value(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("missing-value update should not call model"))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: pytest.fail("should not store missing value")))
+
+    command = nodes.send_direct_response(
+        {
+            "chat_id": "888",
+            "user_message_content": "Can you update my insurance?",
+            "user_message_classification": {
+                "intent": "general_info",
+                "reason": "insurance_update_missing_value",
+            },
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert "provider" in sent[-1]["text"].lower()
+    assert "member id" in sent[-1]["text"].lower()
+    assert "remember my insurance is" in sent[-1]["text"].lower()
+
+
 def test_send_direct_response_uses_fixed_copy_without_side_effects(monkeypatch):
     sent = []
     monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("fixed copy should not call model"))
