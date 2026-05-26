@@ -180,6 +180,33 @@ def test_classify_intent_routes_greeting_to_direct_response_without_model(monkey
     assert command.update["user_message_classification"]["intent"] == "greeting"
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "How are you?",
+        "Thanks!",
+        "You're welcome.",
+        "Sounds good",
+    ],
+)
+def test_classify_intent_routes_small_talk_to_general_response_without_model(monkeypatch, message):
+    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("small talk should be deterministic"))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: pytest.fail("should not interrupt seeded input"))
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": message,
+            "update_id": 10,
+            "classify_current_message": True,
+        }
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["user_message_classification"]["intent"] == "general_response"
+    assert command.update["user_message_classification"]["reason"] == "small_talk_or_acknowledgement"
+
+
 def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypatch):
     monkeypatch.setattr(
         nodes,
@@ -214,7 +241,56 @@ def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypat
     assert add_location.update["location_request_reason"] == "add_location"
     assert location_payload.goto == "store_user_location"
     assert low_confidence.goto == "send_direct_response"
-    assert low_confidence.update["user_message_classification"]["intent"] == "unsupported"
+    assert low_confidence.update["user_message_classification"]["intent"] == "general_response"
+
+
+@pytest.mark.parametrize(
+    ("message", "expected_intent", "expected_goto"),
+    [
+        ("Can you help with dermatology appointments?", "general_info", "send_direct_response"),
+        ("Do you assist with orthodontist visits?", "general_info", "send_direct_response"),
+        ("What kinds of pediatric dental appointments can OneHealth support?", "general_info", "send_direct_response"),
+        ("Can OneHealth handle eye exam appointments?", "general_info", "send_direct_response"),
+        ("Book a dermatology appointment tomorrow.", "appointment", "draft_appointment_details"),
+        ("Please schedule an orthodontist visit next week.", "appointment", "draft_appointment_details"),
+        ("Set up a pediatric dental appointment for Friday.", "appointment", "draft_appointment_details"),
+        ("I need to reschedule my eye exam.", "appointment", "draft_appointment_details"),
+    ],
+)
+def test_classify_intent_prompt_distinguishes_capability_from_booking(
+    monkeypatch,
+    message,
+    expected_intent,
+    expected_goto,
+):
+    captured = []
+
+    class CapturingStructured:
+        def invoke(self, messages):
+            captured.extend(messages)
+            return {"intent": expected_intent, "confidence": 0.92, "reason": "test_case"}
+
+    class CapturingModel:
+        def with_structured_output(self, schema):
+            return CapturingStructured()
+
+    monkeypatch.setattr(nodes, "_model", lambda: CapturingModel())
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": message,
+            "classify_current_message": True,
+        }
+    )
+
+    system_prompt = captured[0].content
+    assert command.goto == expected_goto
+    assert command.update["user_message_classification"]["intent"] == expected_intent
+    assert "directive scheduling intent" in system_prompt
+    assert "Capability verbs" in system_prompt
+    assert "whether OneHealth can help or assist" in system_prompt
+    assert "social small talk" in system_prompt
 
 
 def test_send_direct_response_uses_fixed_copy_without_side_effects(monkeypatch):
@@ -236,7 +312,7 @@ def test_send_direct_response_uses_fixed_copy_without_side_effects(monkeypatch):
     assert sent[-1]["remove_keyboard"] is True
 
 
-def test_send_direct_response_general_uses_safe_model(monkeypatch):
+def test_send_direct_response_general_info_uses_safe_model(monkeypatch):
     sent = []
     monkeypatch.setattr(nodes, "_model", lambda: FakeModel(content="I can help schedule appointments."))
     monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
@@ -245,12 +321,44 @@ def test_send_direct_response_general_uses_safe_model(monkeypatch):
         {
             "chat_id": "888",
             "user_message_content": "Can you help with dermatology?",
-            "user_message_classification": {"intent": "general_response"},
+            "user_message_classification": {"intent": "general_info"},
         }
     )
 
     assert command.goto == nodes.END
     assert sent[-1]["text"] == "I can help schedule appointments."
+
+
+def test_send_direct_response_catch_all_uses_model(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "_model", lambda: FakeModel(content="You are welcome."))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_direct_response(
+        {
+            "chat_id": "888",
+            "user_message_content": "Okay thank you",
+            "user_message_classification": {"intent": "general_response"},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert sent[-1]["text"] == "You are welcome."
+
+
+def test_classify_intent_accepts_model_general_response(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda: FakeModel({"intent": "general_response", "confidence": 0.9, "reason": "small_talk"}),
+    )
+
+    command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "Just chatting for a minute", "classify_current_message": True}
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["user_message_classification"]["intent"] == "general_response"
 
 
 def test_store_user_location_stores_top_level_location_and_ends(monkeypatch):

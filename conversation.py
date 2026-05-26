@@ -129,7 +129,7 @@ def onboarding_ready_text() -> str:
 def greeting_text() -> str:
     return (
         "Hi. I can help book healthcare appointments and remember info you confirm. "
-        "Try: Book a dentist next Tuesday, or Remember my insurance is Aetna."
+        "Try: Book a dentist next Tuesday, or remember my insurance is Aetna."
     )
 
 
@@ -144,21 +144,7 @@ def about_assistant_text() -> str:
 def help_text() -> str:
     return (
         "I can help with appointments, confirmed profile details, and location updates. "
-        "Examples: Book a filling tomorrow, Remember my insurance is Aetna, or /add_location."
-    )
-
-
-def unsupported_text() -> str:
-    return (
-        "I can help book healthcare appointments or remember details you confirm. "
-        "Try asking to book an appointment, update insurance, or add location."
-    )
-
-
-def medical_advice_redirect_text() -> str:
-    return (
-        "I cannot give medical advice or diagnose symptoms. Contact a clinician for "
-        "medical guidance; if this feels urgent, call emergency services."
+        "Examples: Book a filling tomorrow, remember my insurance is Aetna, or /add_location."
     )
 
 

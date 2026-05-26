@@ -9,8 +9,8 @@ class TextClassification(TypedDict):
         "greeting",
         "about_assistant",
         "help",
+        "general_info",
         "general_response",
-        "unsupported",
     ]
     confidence: float
     reason: str
