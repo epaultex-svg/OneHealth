@@ -15,12 +15,15 @@ from nodes import (
     get_provider,
     interpret_user_confirmation,
     onboard,
+    plan_next_turn,
     receive_message,
+    retrieve_info,
     request_user_location,
     select_appointment_type,
     select_appointment_slot,
     select_provider,
     send_direct_response,
+    send_clarify,
     send_appointment_type_options,
     send_correction_query,
     send_provider_options,
@@ -46,9 +49,12 @@ def build_graph(checkpointer=None):
     workflow.add_node("request_user_location", request_user_location)
     workflow.add_node("await_user_location", await_user_location)
     workflow.add_node("onboard", onboard)
+    workflow.add_node("plan_next_turn", plan_next_turn)
     workflow.add_node("classify_intent", classify_intent)
     workflow.add_node("store_user_location", store_user_location)
     workflow.add_node("send_direct_response", send_direct_response)
+    workflow.add_node("retrieve_info", retrieve_info)
+    workflow.add_node("send_clarify", send_clarify)
     workflow.add_node("draft_appointment_details", draft_appointment_details)
     workflow.add_node("draft_user_info_storage_details", draft_user_info_storage_details)
     workflow.add_node("send_user_confirmation", send_user_confirmation)

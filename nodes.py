@@ -32,6 +32,11 @@ from appointments import (
     mark_appointment_failed,
     reserve_appointment_booking,
 )
+from conversation_engine import (
+    plan_conversation_turn as engine_plan_conversation_turn,
+    write_validated_message,
+)
+from conversation_policy import legacy_classification_from_turn, node_for_turn
 from conversation import (
     about_assistant_text,
     appointment_confirmation_text,
@@ -61,6 +66,7 @@ from conversation import (
     saved_text,
     scheduling_loading_text,
 )
+from profile_retrieval import get_retrievable_profile
 from tools import (
     read_message,
     send_message,
@@ -80,6 +86,11 @@ def _model(temperature: float = 0.0) -> ChatOpenRouter:
         api_key=os.getenv("OPENROUTER_API_KEY"),
         temperature=temperature,
     )
+
+
+def _write_validated_text(route: str, context: dict[str, Any], fallback_text: str) -> tuple[str, list[str]]:
+    draft = write_validated_message(route, context, fallback_text=fallback_text, model=_model())
+    return draft["text"], list(draft.get("validation_errors") or [])
 
 
 def _normalize_resume_message(resume: object, state: OneHealthAgentState) -> dict | None:
@@ -767,7 +778,7 @@ def receive_message(state: OneHealthAgentState) -> Command[Literal["ensure_user"
     )
 
 
-def ensure_user(state: OneHealthAgentState) -> Command[Literal["classify_intent"]]:
+def ensure_user(state: OneHealthAgentState) -> Command[Literal["plan_next_turn"]]:
     """Create a minimal Supabase user row, then let intent routing decide UX."""
     chat_id = state["chat_id"]
     username = state.get("username") or None
@@ -782,7 +793,7 @@ def ensure_user(state: OneHealthAgentState) -> Command[Literal["classify_intent"
         if not row.data:
             store_info.invoke({"chat_id": chat_id, "username": username or None})
 
-    return Command(goto="classify_intent")
+    return Command(goto="plan_next_turn")
 
 
 def start_thread(state: OneHealthAgentState) -> Command[Literal["ensure_user", "__end__"]]:
@@ -802,7 +813,7 @@ def request_user_location(state: OneHealthAgentState) -> Command[Literal["await_
     return Command(goto="await_user_location")
 
 
-def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard", "classify_intent", "__end__"]]:
+def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard", "plan_next_turn", "__end__"]]:
     """Wait for location reply, store it, then continue based on request reason."""
     chat_id = state["chat_id"]
     reason = state.get("location_request_reason") or "new_user"
@@ -856,7 +867,7 @@ def await_user_location(state: OneHealthAgentState) -> Command[Literal["onboard"
         goto="onboard",
     )
 
-def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent", "__end__"]]:
+def onboard(state: OneHealthAgentState) -> Command[Literal["plan_next_turn", "__end__"]]:
     """Asks user for all necessary information to create an appointment via Nexhealth. Stores all info in state, and uses store_info to store in Supabase info
     unlikely to change."""
     patient_info = _collect_patient_info(state)
@@ -866,7 +877,7 @@ def onboard(state: OneHealthAgentState) -> Command[Literal["classify_intent", "_
         "chat_id": state["chat_id"],
         "patient_info": patient_info,
     })
-    return Command(update={"patient_info": patient_info}, goto="classify_intent")
+    return Command(update={"patient_info": patient_info}, goto="plan_next_turn")
 
 
 def _normalized_text(text: object) -> str:
@@ -945,7 +956,7 @@ def _deterministic_classification(msg: dict[str, Any]) -> TextClassification | N
         return {"intent": "general_response", "confidence": 1.0, "reason": "top_level_cancel"}
     return None
 
-def classify_intent(
+def plan_next_turn(
     state: OneHealthAgentState,
 ) -> Command[
     Literal[
@@ -954,9 +965,11 @@ def classify_intent(
         "request_user_location",
         "store_user_location",
         "send_direct_response",
+        "retrieve_info",
+        "send_clarify",
     ]
 ]:
-    """Wait for user reply, fetch it via Telegram, classify intent, route on result."""
+    """Plan the next semantic turn, validate route, and return a LangGraph Command."""
     chat_id = state["chat_id"]
 
     if state.get("classify_current_message") and (
@@ -973,74 +986,19 @@ def classify_intent(
         resume = interrupt({"chat_id": chat_id, "prompt": "awaiting_user_message"})
         msg = _resume_or_telegram_message(resume, state)
 
-    classification = _deterministic_classification(msg)
-    if classification is None:
-        system = (
-            "Classify the user's message into exactly one intent:\n"
-            "- 'appointment': user asks OneHealth to take an appointment action now: "
-            "arrange, book, schedule, make, create, reserve, move, reschedule, cancel, "
-            "or otherwise change a specific appointment or visit. Generalize from "
-            "these examples by looking for directive scheduling intent, not just "
-            "appointment-related nouns.\n"
-            "- 'user_info': user explicitly wants to store preferences, profile data, "
-            "insurance, contact info, or other context for future use.\n"
-            "- 'location_update': user wants to add, update, or share location.\n"
-            "- 'greeting': standalone salutation only, such as a brief hello with "
-            "no small-talk question or workflow request.\n"
-            "- 'about_assistant': user asks what OneHealth is or asks about the assistant.\n"
-            "- 'help': user asks what they can do or asks for examples.\n"
-            "- 'general_info': user asks about OneHealth capabilities or workflow, "
-            "or whether OneHealth can help with a specialty, service, or appointment "
-            "category, without asking OneHealth to actually arrange, change, or cancel "
-            "one now. Capability verbs like help, assist, support, handle, explain, "
-            "or similar inquiry wording should route here when the user is asking "
-            "what OneHealth can do.\n"
-            "- 'general_response': any other conversational message, including thanks, "
-            "polite acknowledgements, small talk, social check-ins, unclear text, "
-            "or messages outside OneHealth workflows.\n\n"
-            "Tie-breakers:\n"
-            "- If the message mentions appointments but asks a capability question "
-            "such as whether OneHealth can help or assist with that kind of care, "
-            "choose 'general_info'.\n"
-            "- If the message asks the assistant to perform the scheduling action "
-            "now, choose 'appointment'.\n"
-            "- If the message is social small talk, a thanks, an acknowledgement, "
-            "or a pleasantry, choose 'general_response', not 'greeting'.\n\n"
-            "Return intent, confidence from 0.0 to 1.0, and a short reason. "
-            "Do not classify casual questions as user_info unless the user asked "
-            "to remember, save, or update specific profile data."
-        )
-        classifier = _model().with_structured_output(TextClassification)
-        classification = classifier.invoke([
-            SystemMessage(content=system),
-            HumanMessage(content=msg["user_message_content"]),
-        ])
-
-    classification = {
-        "intent": classification["intent"],
-        "confidence": float(classification.get("confidence", 1.0)),
-        "reason": classification.get("reason", ""),
-    }
+    turn = engine_plan_conversation_turn(msg, state)
+    if turn.get("intent") == "location_update" and not msg.get("location"):
+        turn = {**turn, "action": "request_user_location"}
+    classification = legacy_classification_from_turn(turn)
     intent = classification["intent"]
-    if classification["confidence"] < 0.55:
-        intent = "general_response"
-        classification = {**classification, "intent": intent}
-
-    if intent == "appointment":
-        next_node = "draft_appointment_details"
-    elif intent == "user_info":
-        next_node = "draft_user_info_storage_details"
-    elif intent == "location_update" and msg.get("location"):
-        next_node = "store_user_location"
-    elif intent == "location_update":
-        next_node = "request_user_location"
-    else:
-        next_node = "send_direct_response"
+    next_node = node_for_turn(turn)
 
     update = {
         "user_message_content": msg["user_message_content"],
         "user_location": msg.get("location"),
         "user_message_classification": classification,
+        "conversation_turn": turn,
+        "conversation_route": turn.get("action"),
         "update_id": msg.get("update_id"),
         "classify_current_message": False,
     }
@@ -1051,6 +1009,23 @@ def classify_intent(
         update=update,
         goto=next_node,
     )
+
+
+def classify_intent(
+    state: OneHealthAgentState,
+) -> Command[
+    Literal[
+        "draft_appointment_details",
+        "draft_user_info_storage_details",
+        "request_user_location",
+        "store_user_location",
+        "send_direct_response",
+        "retrieve_info",
+        "send_clarify",
+    ]
+]:
+    """Compatibility wrapper for older graph/eval references."""
+    return plan_next_turn(state)
 
 
 def store_user_location(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
@@ -1066,36 +1041,77 @@ def store_user_location(state: OneHealthAgentState) -> Command[Literal["__end__"
     return Command(update={"location_request_reason": None}, goto=END)
 
 
+def retrieve_info(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """Read saved profile data and answer through the guarded writer."""
+    turn = state.get("conversation_turn") or {}
+    profile = get_retrievable_profile(
+        state["chat_id"],
+        requested_fields=list(turn.get("requested_fields") or []),
+        include_sensitive_fields=list(turn.get("include_sensitive_fields") or []),
+        categories_only=bool(turn.get("categories_only", False)),
+    )
+    context = {
+        "user_message_content": state.get("user_message_content", ""),
+        "retrieved_profile": profile,
+        "sensitive_values": profile.get("sensitive_values", []),
+        "allowed_sensitive_values": profile.get("allowed_sensitive_values", []),
+        "missing_fields": profile.get("missing_fields", []),
+    }
+    fallback = "I cannot safely show that from the current saved profile. You can update it by saying: Remember my insurance is Aetna."
+    response, errors = _write_validated_text("retrieve_info", context, fallback)
+
+    send_message.invoke({"chat_id": state["chat_id"], "text": response, "remove_keyboard": True})
+    return Command(
+        update={
+            "retrieved_profile": profile,
+            "direct_response": response,
+            "message_validation_errors": errors,
+        },
+        goto=END,
+    )
+
+
+def send_clarify(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """Ask one safe clarification question when planner confidence is low."""
+    context = {
+        "user_message_content": state.get("user_message_content", ""),
+        "conversation_turn": state.get("conversation_turn") or {},
+    }
+    fallback = "What would you like me to help with: booking an appointment, saved profile info, or location?"
+    response, errors = _write_validated_text("clarify", context, fallback)
+    send_message.invoke({"chat_id": state["chat_id"], "text": response, "remove_keyboard": True})
+    return Command(update={"direct_response": response, "message_validation_errors": errors}, goto=END)
+
+
 def send_direct_response(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     """Send side-effect-free replies for non-workflow messages."""
     intent = (state.get("user_message_classification") or {}).get("intent")
     text = state.get("user_message_content", "")
+    turn = state.get("conversation_turn") or {}
 
     if intent == "greeting":
-        response = greeting_text()
+        fallback = greeting_text()
     elif intent == "about_assistant":
-        response = about_assistant_text()
+        fallback = about_assistant_text()
     elif intent == "help":
-        response = help_text()
+        fallback = help_text()
+    elif turn.get("intent") in {"appointment_view", "appointment_reschedule", "appointment_cancel"}:
+        fallback = "I can help book appointments right now. Viewing, rescheduling, and cancelling appointments are not available yet."
+    elif "cancel_requested" in (turn.get("safety_flags") or []):
+        fallback = cancelled_text()
     else:
-        response = _model().invoke([
-            SystemMessage(content=(
-                "You are OneHealth, a Telegram assistant for healthcare appointment scheduling. "
-                "You can help book appointments through supported clinics and remember user "
-                "info only after explicit confirmation. You cannot give medical diagnosis or "
-                "treatment advice, claim booking is complete unless the booking workflow "
-                "succeeded, store info without confirmation, or invent clinic availability. "
-                "If the user asks about OneHealth capabilities or workflow, answer briefly "
-                "with what OneHealth can do. If the user says thanks, acknowledges a prior "
-                "message, asks small talk like how you are, or says something outside the "
-                "supported workflows, respond naturally and briefly without starting any "
-                "workflow. Offer one useful next action only when it fits the user's message."
-            )),
-            HumanMessage(content=text),
-        ]).content
+        fallback = "I can help with appointments, saved profile info, and location updates."
+
+    context = {
+        "intent": intent,
+        "conversation_turn": turn,
+        "user_message_content": text,
+        "supported_workflows": ["book appointments", "retrieve saved profile info", "store confirmed profile info", "update location"],
+    }
+    response, errors = _write_validated_text("direct_response", context, fallback)
 
     send_message.invoke({"chat_id": state["chat_id"], "text": response, "remove_keyboard": True})
-    return Command(update={"direct_response": response}, goto=END)
+    return Command(update={"direct_response": response, "message_validation_errors": errors}, goto=END)
 
 def draft_appointment_details(
     state: OneHealthAgentState,
@@ -1137,10 +1153,22 @@ def draft_appointment_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
-    draft = appointment_confirmation_text(details)
+    fallback = appointment_confirmation_text(details)
+    draft, validation_errors = _write_validated_text(
+        "appointment_confirmation",
+        {
+            "user_message_content": user_message_content,
+            "appointment_details": details,
+        },
+        fallback,
+    )
 
     return Command(
-        update={"appt_draft": draft, "appt_details": details},
+        update={
+            "appt_draft": draft,
+            "appt_details": details,
+            "message_validation_errors": validation_errors,
+        },
         goto="send_user_confirmation",
     )
 
@@ -1170,12 +1198,21 @@ def draft_user_info_storage_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
-    draft = profile_confirmation_text(extracted)
+    fallback = profile_confirmation_text(extracted)
+    draft, validation_errors = _write_validated_text(
+        "store_user_info_draft",
+        {
+            "user_message_content": user_message_content,
+            "extracted_fields": extracted,
+        },
+        fallback,
+    )
 
     return Command(
         update={
             "user_info_draft": draft,
             "user_info_extracted": extracted,
+            "message_validation_errors": validation_errors,
         },
         goto="send_user_confirmation",
     )
@@ -1398,11 +1435,19 @@ def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", 
     )
     locations = _extract_items(payload, "locations")
     if not locations:
+        text, errors = _write_validated_text(
+            "no_results",
+            {
+                "current_search": "NexHealth locations",
+                "allowed_recovery_actions": ["check the clinic setup", "try again later"],
+            },
+            no_locations_text(),
+        )
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": no_locations_text(),
+            "text": text,
         })
-        return Command(update=token_update, goto=END)
+        return Command(update={**token_update, "message_validation_errors": errors}, goto=END)
 
     selected = None
     if len(locations) == 1:
@@ -1458,11 +1503,19 @@ def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_o
     )
     providers = _extract_items(payload, "providers")
     if not providers:
+        text, errors = _write_validated_text(
+            "no_results",
+            {
+                "current_search": "bookable providers",
+                "allowed_recovery_actions": ["try a different location", "change the request", "reply Cancel"],
+            },
+            no_providers_text(),
+        )
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": no_providers_text(),
+            "text": text,
         })
-        return Command(update=token_update, goto=END)
+        return Command(update={**token_update, "message_validation_errors": errors}, goto=END)
 
     selected = None
     if len(providers) == 1:
@@ -1664,11 +1717,19 @@ def get_appointment_type(state: OneHealthAgentState) -> Command[Literal["send_ap
     )
     appointment_types = _extract_items(payload, "appointment_types")
     if not appointment_types:
+        text, errors = _write_validated_text(
+            "no_results",
+            {
+                "current_search": "appointment types",
+                "allowed_recovery_actions": ["try a different reason for visit", "reply Cancel"],
+            },
+            no_appointment_types_text(),
+        )
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": no_appointment_types_text(),
+            "text": text,
         })
-        return Command(update=token_update, goto=END)
+        return Command(update={**token_update, "message_validation_errors": errors}, goto=END)
 
     selected = None
     if len(appointment_types) == 1:
@@ -1789,11 +1850,27 @@ def get_appointment_slots(state: OneHealthAgentState) -> Command[Literal["send_s
         days = 1
 
     if not slots:
+        text, errors = _write_validated_text(
+            "no_results",
+            {
+                "current_search": {
+                    "start_date": window["start_date"],
+                    "days": window["days"],
+                    "searched_dates": sorted(searched_dates),
+                },
+                "allowed_recovery_actions": [
+                    "try another date",
+                    "choose a different provider or appointment type",
+                    "reply Cancel",
+                ],
+            },
+            no_slots_text(),
+        )
         send_message.invoke({
             "chat_id": state["chat_id"],
-            "text": no_slots_text(),
+            "text": text,
         })
-        return Command(update=token_update, goto=END)
+        return Command(update={**token_update, "message_validation_errors": errors}, goto=END)
 
     return Command(
         update={**token_update, "nexhealth_available_slots": slots},
@@ -1894,15 +1971,24 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     )
     if not reservation.get("should_book"):
         status = reservation.get("status")
+        text, errors = _write_validated_text(
+            "booking_success",
+            {
+                "booking_result": {"status": "duplicate" if status == "booked" else status},
+                "readable_start_time": readable_start_time,
+            },
+            booking_duplicate_text(readable_start_time, status),
+        )
         send_message.invoke({
             "chat_id": chat_id,
-            "text": booking_duplicate_text(readable_start_time, status),
+            "text": text,
             "remove_keyboard": True,
         })
         return Command(
             update={
                 "appointment_booking_key": booking_key,
                 "appointment_booking_status": status,
+                "message_validation_errors": errors,
             },
             goto=END,
         )
@@ -1934,9 +2020,17 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
         nexhealth_response=payload,
         nexhealth_appointment_id=appointment_id,
     )
+    text, errors = _write_validated_text(
+        "booking_success",
+        {
+            "booking_result": {"status": "booked", "nexhealth_appointment_id": appointment_id},
+            "readable_start_time": readable_start_time,
+        },
+        booking_success_text(readable_start_time),
+    )
     send_message.invoke({
         "chat_id": chat_id,
-        "text": booking_success_text(readable_start_time),
+        "text": text,
         "remove_keyboard": True,
     })
 
@@ -1947,6 +2041,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
             "nexhealth_appointment_result": payload,
             "appointment_booking_key": booking_key,
             "appointment_booking_status": "booked",
+            "message_validation_errors": errors,
         },
         goto=END,
     )

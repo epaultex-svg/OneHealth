@@ -1,7 +1,10 @@
 import pytest
 
 import conversation
+import conversation_engine
+import message_validation
 import nodes
+import profile_retrieval
 from evals.onehealth_evaluators import user_experience_assertions_evaluator
 
 
@@ -23,6 +26,14 @@ class FakeModel:
 
     def invoke(self, messages):
         return type("Response", (), {"content": self.content})()
+
+
+class SequenceModel:
+    def __init__(self, responses):
+        self.responses = list(responses)
+
+    def invoke(self, messages):
+        return type("Response", (), {"content": self.responses.pop(0)})()
 
 
 class FakeTool:
@@ -127,7 +138,7 @@ def test_ensure_user_creates_minimal_row_and_routes_to_classifier(monkeypatch):
 
     command = nodes.ensure_user({"chat_id": "888", "username": "paul"})
 
-    assert command.goto == "classify_intent"
+    assert command.goto == "plan_next_turn"
     assert stored == [{"chat_id": "888", "username": "paul"}]
 
 
@@ -137,11 +148,11 @@ def test_ensure_user_existing_user_skips_onboarding(monkeypatch):
 
     command = nodes.ensure_user({"chat_id": "888", "username": "paul"})
 
-    assert command.goto == "classify_intent"
+    assert command.goto == "plan_next_turn"
 
 
 def test_classify_intent_uses_seeded_message_without_interrupt(monkeypatch):
-    monkeypatch.setattr(nodes, "_model", lambda: FakeModel())
+    monkeypatch.setattr(conversation_engine, "_model", lambda temperature=0.0: FakeModel())
 
     def fail_interrupt(payload):
         raise AssertionError("classify_intent should not interrupt seeded webhook input")
@@ -209,9 +220,9 @@ def test_classify_intent_routes_small_talk_to_general_response_without_model(mon
 
 def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypatch):
     monkeypatch.setattr(
-        nodes,
+        conversation_engine,
         "_model",
-        lambda: FakeModel({"intent": "appointment", "confidence": 0.2, "reason": "unclear"}),
+        lambda temperature=0.0: FakeModel({"intent": "appointment", "confidence": 0.2, "reason": "unclear"}),
     )
 
     about = nodes.classify_intent(
@@ -240,8 +251,8 @@ def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypat
     assert add_location.goto == "request_user_location"
     assert add_location.update["location_request_reason"] == "add_location"
     assert location_payload.goto == "store_user_location"
-    assert low_confidence.goto == "send_direct_response"
-    assert low_confidence.update["user_message_classification"]["intent"] == "general_response"
+    assert low_confidence.goto == "send_clarify"
+    assert low_confidence.update["user_message_classification"]["intent"] == "clarify"
 
 
 @pytest.mark.parametrize(
@@ -254,7 +265,7 @@ def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypat
         ("Book a dermatology appointment tomorrow.", "appointment", "draft_appointment_details"),
         ("Please schedule an orthodontist visit next week.", "appointment", "draft_appointment_details"),
         ("Set up a pediatric dental appointment for Friday.", "appointment", "draft_appointment_details"),
-        ("I need to reschedule my eye exam.", "appointment", "draft_appointment_details"),
+        ("I need to reschedule my eye exam.", "appointment_reschedule", "send_direct_response"),
     ],
 )
 def test_classify_intent_prompt_distinguishes_capability_from_booking(
@@ -274,7 +285,7 @@ def test_classify_intent_prompt_distinguishes_capability_from_booking(
         def with_structured_output(self, schema):
             return CapturingStructured()
 
-    monkeypatch.setattr(nodes, "_model", lambda: CapturingModel())
+    monkeypatch.setattr(conversation_engine, "_model", lambda temperature=0.0: CapturingModel())
 
     command = nodes.classify_intent(
         {
@@ -287,15 +298,15 @@ def test_classify_intent_prompt_distinguishes_capability_from_booking(
     system_prompt = captured[0].content
     assert command.goto == expected_goto
     assert command.update["user_message_classification"]["intent"] == expected_intent
-    assert "directive scheduling intent" in system_prompt
-    assert "Capability verbs" in system_prompt
-    assert "whether OneHealth can help or assist" in system_prompt
-    assert "social small talk" in system_prompt
+    assert "Capability questions go general_info" in system_prompt
+    assert "appointment_book" in system_prompt
+    assert "retrieve_info" in system_prompt
+    assert "ALLOWED_ACTIONS" in system_prompt
 
 
-def test_send_direct_response_uses_fixed_copy_without_side_effects(monkeypatch):
+def test_send_direct_response_uses_guarded_writer_without_side_effects(monkeypatch):
     sent = []
-    monkeypatch.setattr(nodes, "_model", lambda: pytest.fail("fixed copy should not call model"))
+    monkeypatch.setattr(nodes, "_model", lambda: FakeModel(content="I am OneHealth. I can help with scheduling."))
     monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
     monkeypatch.setattr(nodes, "store_info", FakeTool(lambda payload: pytest.fail("should not store")))
 
@@ -348,9 +359,9 @@ def test_send_direct_response_catch_all_uses_model(monkeypatch):
 
 def test_classify_intent_accepts_model_general_response(monkeypatch):
     monkeypatch.setattr(
-        nodes,
+        conversation_engine,
         "_model",
-        lambda: FakeModel({"intent": "general_response", "confidence": 0.9, "reason": "small_talk"}),
+        lambda temperature=0.0: FakeModel({"intent": "general_response", "confidence": 0.9, "reason": "small_talk"}),
     )
 
     command = nodes.classify_intent(
@@ -359,6 +370,87 @@ def test_classify_intent_accepts_model_general_response(monkeypatch):
 
     assert command.goto == "send_direct_response"
     assert command.update["user_message_classification"]["intent"] == "general_response"
+
+
+def test_plan_next_turn_routes_saved_insurance_lookup_with_model(monkeypatch):
+    monkeypatch.setattr(
+        conversation_engine,
+        "_model",
+        lambda temperature=0.0: FakeModel(
+            {
+                "intent": "retrieve_info",
+                "confidence": 0.95,
+                "action": "retrieve_info",
+                "requested_fields": ["insurance"],
+                "reason": "saved_profile_lookup",
+            }
+        ),
+    )
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": "What insurance do you have saved for me?",
+            "classify_current_message": True,
+        }
+    )
+
+    assert command.goto == "retrieve_info"
+    assert command.update["user_message_classification"]["intent"] == "retrieve_info"
+    assert command.update["conversation_turn"]["requested_fields"] == ["insurance"]
+
+
+def test_retrieve_info_sanitizes_profile_before_writer(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        profile_retrieval,
+        "create_client",
+        lambda *args, **kwargs: FakeSupabaseClient([
+            {"insurance": {"provider": "Aetna", "member_id": "SECRET123", "group_id": "GRP9"}}
+        ]),
+    )
+    monkeypatch.setattr(nodes, "_model", lambda: FakeModel(content="Your saved insurance provider is Aetna."))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.retrieve_info(
+        {
+            "chat_id": "888",
+            "user_message_content": "What is my insurance?",
+            "conversation_turn": {"requested_fields": ["insurance"]},
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert command.update["retrieved_profile"]["fields"]["insurance"] == {"provider": "Aetna"}
+    assert "SECRET123" not in sent[-1]["text"]
+
+
+def test_message_validator_blocks_sensitive_profile_leak():
+    validation = message_validation.validate_generated_message(
+        {"text": "Your member ID is SECRET123."},
+        "retrieve_info",
+        {
+            "retrieved_profile": {"fields": {"insurance": {"provider": "Aetna"}}},
+            "sensitive_values": ["SECRET123"],
+            "allowed_sensitive_values": [],
+        },
+    )
+
+    assert validation["valid"] is False
+    assert "phi_overexposure" in validation["errors"]
+
+
+def test_writer_retries_once_then_uses_fallback():
+    draft = conversation_engine.write_validated_message(
+        "appointment_confirmation",
+        {"appointment_details": {"Date": "tomorrow"}, "user_message_content": "book me"},
+        fallback_text="Confirm appointment details:\n- Date: tomorrow\n- Specialty: not specified\n- Practice: not specified\n- Reason: not specified\n- Insurance: not specified\n- Location: not specified\nDoes this look right?",
+        model=SequenceModel(["ok", "still ok"]),
+    )
+
+    assert draft["source"] == "fallback"
+    assert draft["validation_errors"]
+    assert "Date: tomorrow" in draft["text"]
 
 
 def test_store_user_location_stores_top_level_location_and_ends(monkeypatch):
@@ -403,7 +495,7 @@ def test_await_user_location_add_location_ends_after_storing(monkeypatch):
 
 
 def test_classify_intent_still_interrupts_without_seed_flag(monkeypatch):
-    monkeypatch.setattr(nodes, "_model", lambda: FakeModel())
+    monkeypatch.setattr(conversation_engine, "_model", lambda temperature=0.0: FakeModel())
 
     def fake_interrupt(payload):
         assert payload["prompt"] == "awaiting_user_message"
@@ -565,6 +657,11 @@ def test_select_provider_invalid_choice_reprompts_then_cancel(monkeypatch):
 
 def test_get_appointment_slots_empty_result_offers_recovery(monkeypatch):
     sent = []
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda: FakeModel(content="No open slots. Try another date or choose a different provider or appointment type."),
+    )
     monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
     monkeypatch.setattr(nodes, "_nexhealth_request", lambda *args, **kwargs: ({"data": []}, {}))
 
@@ -579,8 +676,8 @@ def test_get_appointment_slots_empty_result_offers_recovery(monkeypatch):
     )
 
     assert command.goto == nodes.END
-    assert "try another date" in sent[-1]["text"]
-    assert "different provider" in sent[-1]["text"]
+    assert "try another date" in sent[-1]["text"].lower()
+    assert "different provider" in sent[-1]["text"].lower()
 
 
 def test_user_experience_evaluator_scores_declared_assertions():
@@ -613,6 +710,11 @@ def test_book_appointment_skips_nexhealth_when_booking_already_booked(monkeypatc
     sent = []
     monkeypatch.setattr(
         nodes,
+        "_model",
+        lambda: FakeModel(content="Booked your appointment for Tuesday, May 26 at 9:00 AM."),
+    )
+    monkeypatch.setattr(
+        nodes,
         "reserve_appointment_booking",
         lambda **kwargs: {"should_book": False, "status": "booked"},
     )
@@ -640,6 +742,11 @@ def test_book_appointment_skips_nexhealth_when_booking_already_booked(monkeypatc
 def test_book_appointment_marks_normalized_booking_success(monkeypatch):
     sent = []
     marked = []
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda: FakeModel(content="Booked your appointment for Tuesday, May 26 at 9:00 AM."),
+    )
     monkeypatch.setattr(
         nodes,
         "reserve_appointment_booking",
