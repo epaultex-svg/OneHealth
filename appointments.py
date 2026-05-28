@@ -34,6 +34,7 @@ def _json_safe(value: Any) -> Any:
 def appointment_booking_key(
     *,
     chat_id: str,
+    institution_subdomain: str,
     patient_id: int,
     location_id: int,
     provider_id: int,
@@ -44,6 +45,7 @@ def appointment_booking_key(
     payload = {
         "appointment_type_id": appointment_type_id,
         "chat_id": str(chat_id),
+        "institution_subdomain": institution_subdomain,
         "location_id": location_id,
         "operatory_id": operatory_id,
         "patient_id": patient_id,

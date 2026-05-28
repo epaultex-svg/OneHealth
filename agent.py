@@ -8,6 +8,7 @@ from nodes import (
     correct_info,
     draft_appointment_details,
     draft_user_info_storage_details,
+    get_institution,
     get_appointment_slots,
     get_appointment_type,
     get_location,
@@ -15,17 +16,24 @@ from nodes import (
     get_provider,
     interpret_user_confirmation,
     onboard,
+    plan_next_turn,
     receive_message,
+    retrieve_info,
     request_user_location,
+    select_location,
     select_appointment_type,
     select_appointment_slot,
     select_provider,
     send_direct_response,
+    send_clarify,
+    send_institution_options,
+    send_location_options,
     send_appointment_type_options,
     send_correction_query,
     send_provider_options,
     send_user_confirmation,
     send_slot_options,
+    select_institution,
     start_nexhealth_scheduling,
     start_thread,
     ensure_user,
@@ -46,18 +54,26 @@ def build_graph(checkpointer=None):
     workflow.add_node("request_user_location", request_user_location)
     workflow.add_node("await_user_location", await_user_location)
     workflow.add_node("onboard", onboard)
+    workflow.add_node("plan_next_turn", plan_next_turn)
     workflow.add_node("classify_intent", classify_intent)
     workflow.add_node("store_user_location", store_user_location)
-    workflow.add_node("send_direct_response", send_direct_response)
+    workflow.add_node("send_direct_response", send_direct_response, retry_policy=RetryPolicy(max_attempts=3))
+    workflow.add_node("retrieve_info", retrieve_info)
+    workflow.add_node("send_clarify", send_clarify, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("draft_appointment_details", draft_appointment_details)
     workflow.add_node("draft_user_info_storage_details", draft_user_info_storage_details)
-    workflow.add_node("send_user_confirmation", send_user_confirmation)
+    workflow.add_node("send_user_confirmation", send_user_confirmation, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("interpret_user_confirmation", interpret_user_confirmation)
     workflow.add_node("send_correction_query", send_correction_query)
     workflow.add_node("correct_info", correct_info)
     workflow.add_node("store_in_supabase", store_in_supabase, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("start_nexhealth_scheduling", start_nexhealth_scheduling)
+    workflow.add_node("get_institution", get_institution, retry_policy=RetryPolicy(max_attempts=3))
+    workflow.add_node("send_institution_options", send_institution_options)
+    workflow.add_node("select_institution", select_institution)
     workflow.add_node("get_location", get_location, retry_policy=RetryPolicy(max_attempts=3))
+    workflow.add_node("send_location_options", send_location_options)
+    workflow.add_node("select_location", select_location)
     workflow.add_node("get_provider", get_provider, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("send_provider_options", send_provider_options)
     workflow.add_node("select_provider", select_provider)

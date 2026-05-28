@@ -1,5 +1,7 @@
 from typing import Literal, Required, TypedDict
 
+from conversation_models import ConversationTurn, RetrievedProfile
+
 
 class TextClassification(TypedDict):
     intent: Literal[
@@ -11,6 +13,13 @@ class TextClassification(TypedDict):
         "help",
         "general_info",
         "general_response",
+        "retrieve_info",
+        "store_user_info",
+        "appointment_book",
+        "appointment_view",
+        "appointment_reschedule",
+        "appointment_cancel",
+        "clarify",
     ]
     confidence: float
     reason: str
@@ -23,6 +32,7 @@ class ConfirmationDecision(TypedDict):
 class AppointmentDetails(TypedDict):
     Date: str
     Specialty: str
+    Provider: str
     Practice: str
     Reason: str
     Insurance: str
@@ -53,6 +63,7 @@ class NexHealthSlot(TypedDict, total=False):
 class NexHealthOption(TypedDict, total=False):
     id: int
     label: str
+    subdomain: str
     record: dict
 
 
@@ -68,7 +79,11 @@ class OneHealthAgentState(TypedDict, total=False):
     username: str
     message_history: list[str]
     user_message_classification: TextClassification | None
+    conversation_turn: ConversationTurn | None
+    conversation_route: str | None
+    message_validation_errors: list[str]
     direct_response: str
+    retrieved_profile: RetrievedProfile | None
 
     # appointment information
     appt_details: AppointmentDetails
@@ -78,6 +93,10 @@ class OneHealthAgentState(TypedDict, total=False):
     nexhealth_bearer_token: str | None
     nexhealth_bearer_token_created_at: str | None
     nexhealth_patient_id: int | None
+    nexhealth_institution_id: int | None
+    nexhealth_institution_subdomain: str | None
+    nexhealth_institution_options: list[NexHealthOption]
+    nexhealth_institution_warning: str
     nexhealth_provider_id: int | None
     nexhealth_provider_options: list[NexHealthOption]
     nexhealth_location_id: int | None
