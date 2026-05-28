@@ -49,9 +49,13 @@ Rules:
 - Cancel/stop/never mind always sets safety_flags=["cancel_requested"].
 - Telegram location payload always location_update.
 - Capability questions go general_info, not appointment_book.
+- Generic booking requests with no appointment details go clarify, not appointment_book.
+  Examples: "Can you make an appointment for me?", "I need an appointment".
+- Choose appointment_book only when the message asks to book/schedule/create/reserve
+  and includes at least one concrete appointment detail: date/time, specialty,
+  reason/procedure, provider, practice, or appointment type.
 - Questions about whether OneHealth can update stored info, or how to update it, go general_info unless the message includes concrete new values to store.
-- Examples: "can you update my insurance?" -> direct_response. "remember my insurance is Aetna" -> store_user_info/store_user_info_draft. "can you book an appointment" -> direct_response
-"can you store info" -> direct_response
+- Examples: "can you update my insurance?" -> general_info/direct_response. "remember my insurance is Aetna" -> store_user_info/store_user_info_draft.
 - If confidence < 0.65, choose clarify.
 
 Output schema:
@@ -97,8 +101,8 @@ If no supported fields exist, ask user to provide supported info instead of conf
 """,
     "appointment_confirmation": """Create confirmation message for appointment request.
 
-Include every APPOINTMENT_DETAILS field: date, specialty, practice, reason, insurance, location.
-Use "not specified" for missing values.
+Include only non-empty APPOINTMENT_DETAILS fields: date, specialty, provider, practice, reason, insurance, location.
+Do not write "not specified", "unknown", "none", or placeholder bullets.
 Ask explicit yes/change/cancel question.
 Do not imply availability was checked.
 Do not say appointment is booked.
@@ -178,6 +182,15 @@ def plan_conversation_turn(
         SystemMessage(content=build_planner_prompt(state, list(allowed_actions))),
         HumanMessage(content=str(msg.get("user_message_content", ""))),
     ])
+    if raw_turn is None:
+        fallback = coerce_turn({}, allowed_actions)
+        return {
+            **fallback,
+            "intent": "clarify",
+            "action": "clarify",
+            "safety_flags": [*fallback.get("safety_flags", []), "bad_format"],
+            "reason": "planner_returned_no_structured_output",
+        }
     turn = coerce_turn(dict(raw_turn), allowed_actions)
     validation = validate_planner_output(turn, list(allowed_actions))
     if validation["valid"]:

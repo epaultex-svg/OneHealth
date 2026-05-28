@@ -74,7 +74,9 @@ def test_conversation_state_table_covers_user_facing_steps():
         "patient_info",
         "appointment_confirmation",
         "profile_confirmation",
+        "institution_selection",
         "provider_selection",
+        "practice_location_selection",
         "appointment_type_selection",
         "slot_selection",
         "booking",
@@ -253,6 +255,55 @@ def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypat
     assert location_payload.goto == "store_user_location"
     assert low_confidence.goto == "send_clarify"
     assert low_confidence.update["user_message_classification"]["intent"] == "clarify"
+
+
+def test_plan_conversation_turn_handles_none_structured_output():
+    class NoneStructuredModel:
+        def with_structured_output(self, schema):
+            return FakeStructured(None)
+
+    turn = conversation_engine.plan_conversation_turn(
+        {"user_message_content": "BCBS HMO plan"},
+        {"current_step": "idle"},
+        model=NoneStructuredModel(),
+    )
+
+    assert turn["intent"] == "clarify"
+    assert turn["action"] == "clarify"
+    assert "bad_format" in turn["safety_flags"]
+    assert turn["reason"] == "planner_returned_no_structured_output"
+
+
+def test_classify_intent_clarifies_generic_appointment_request(monkeypatch):
+    monkeypatch.setattr(
+        conversation_engine,
+        "_model",
+        lambda temperature=0.0: FakeModel(
+            {
+                "intent": "appointment_book",
+                "confidence": 0.99,
+                "action": "draft_appointment",
+                "appointment_action": "book",
+                "reason": "model would otherwise route to booking",
+            }
+        ),
+    )
+
+    command = nodes.classify_intent(
+        {
+            "chat_id": "888",
+            "user_message_content": "Can you make an appointment for me",
+            "classify_current_message": True,
+        }
+    )
+
+    assert command.goto == "send_clarify"
+    assert command.update["conversation_route"] == "clarify"
+    assert command.update["user_message_classification"]["intent"] == "clarify"
+    assert command.update["conversation_turn"]["missing_fields"] == [
+        "appointment_type_or_reason",
+        "preferred_date",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -480,17 +531,174 @@ def test_message_validator_blocks_sensitive_profile_leak():
     assert "phi_overexposure" in validation["errors"]
 
 
+def test_appointment_confirmation_text_omits_missing_fields_and_includes_provider():
+    text = conversation.appointment_confirmation_text(
+        {
+            "Date": "5/27",
+            "Specialty": "Dentist",
+            "Provider": "Jonas Salk",
+            "Practice": "not specified",
+            "Reason": "",
+            "Insurance": "unknown",
+            "Location": None,
+        }
+    )
+
+    assert "- Date: 5/27" in text
+    assert "- Specialty: Dentist" in text
+    assert "- Provider: Jonas Salk" in text
+    assert "Practice" not in text
+    assert "Reason" not in text
+    assert "Insurance" not in text
+    assert "Location" not in text
+    assert "not specified" not in text
+    assert text.endswith("Does this look right?")
+
+
+def test_appointment_confirmation_text_empty_details_asks_for_more_detail():
+    text = conversation.appointment_confirmation_text(
+        {
+            "Date": "not specified",
+            "Specialty": "",
+            "Provider": "unknown",
+        }
+    )
+
+    assert "more detail" in text
+    assert "Does this look right?" not in text
+
+
+def test_message_validator_accepts_sparse_appointment_confirmation():
+    validation = message_validation.validate_generated_message(
+        {"text": "Confirm appointment details:\n- Date: 5/27\n- Specialty: Dentist\nDoes this look right?"},
+        "appointment_confirmation",
+        {"appointment_details": {"Date": "5/27", "Specialty": "Dentist"}},
+    )
+
+    assert validation["valid"] is True
+
+
+def test_message_validator_rejects_empty_appointment_confirmation():
+    validation = message_validation.validate_generated_message(
+        {"text": "Confirm appointment details:\nDoes this look right?"},
+        "appointment_confirmation",
+        {"appointment_details": {"Date": "", "Specialty": "not specified"}},
+    )
+
+    assert validation["valid"] is False
+    assert "missing_required_info" in validation["errors"]
+
+
 def test_writer_retries_once_then_uses_fallback():
     draft = conversation_engine.write_validated_message(
         "appointment_confirmation",
         {"appointment_details": {"Date": "tomorrow"}, "user_message_content": "book me"},
-        fallback_text="Confirm appointment details:\n- Date: tomorrow\n- Specialty: not specified\n- Practice: not specified\n- Reason: not specified\n- Insurance: not specified\n- Location: not specified\nDoes this look right?",
+        fallback_text="Confirm appointment details:\n- Date: tomorrow\nDoes this look right?",
         model=SequenceModel(["ok", "still ok"]),
     )
 
     assert draft["source"] == "fallback"
     assert draft["validation_errors"]
     assert "Date: tomorrow" in draft["text"]
+    assert "not specified" not in draft["text"]
+
+
+def test_draft_appointment_details_uses_sparse_fallback_with_saved_defaults(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "create_client",
+        lambda *args, **kwargs: FakeSupabaseClient([
+            {
+                "location": "30.196697, -95.501134",
+                "insurance": "Aetna",
+            }
+        ]),
+    )
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda temperature=0.0: FakeModel(
+            structured={
+                "Date": "5/27",
+                "Specialty": "Dentist",
+                "Provider": "",
+                "Practice": "not specified",
+                "Reason": "",
+                "Insurance": "Aetna",
+                "Location": "30.196697, -95.501134",
+            },
+            content="ok",
+        ),
+    )
+
+    command = nodes.draft_appointment_details(
+        {
+            "chat_id": "888",
+            "user_message_content": "Dentist, 5/27",
+        }
+    )
+
+    draft = command.update["appt_draft"]
+    assert "- Date: 5/27" in draft
+    assert "- Specialty: Dentist" in draft
+    assert "- Insurance: Aetna" in draft
+    assert "- Location: 30.196697, -95.501134" in draft
+    assert "Practice" not in draft
+    assert "Reason" not in draft
+    assert "not specified" not in draft
+
+
+def test_correct_info_appointment_prompt_uses_relaxed_provider_schema(monkeypatch):
+    captured = []
+
+    class CapturingStructured(FakeStructured):
+        def invoke(self, messages):
+            captured.append(messages)
+            return super().invoke(messages)
+
+    class CapturingModel(FakeModel):
+        def with_structured_output(self, schema):
+            return CapturingStructured(self.structured)
+
+        def invoke(self, messages):
+            captured.append(messages)
+            return super().invoke(messages)
+
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: {"text": "with Jonas Salk", "update_id": 12})
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda temperature=0.0: CapturingModel(
+            structured={
+                "Date": "5/27",
+                "Specialty": "Dentist",
+                "Provider": "Jonas Salk",
+                "Practice": "",
+                "Reason": "",
+                "Insurance": "",
+                "Location": "",
+            },
+            content="Okay, updated...\n- Date: 5/27\n- Specialty: Dentist\n- Provider: Jonas Salk\nDoes this look right?",
+        ),
+    )
+
+    command = nodes.correct_info(
+        {
+            "chat_id": "888",
+            "user_message_classification": {"intent": "appointment"},
+            "appt_draft": "Confirm appointment details:\n- Date: 5/27\n- Specialty: Dentist\nDoes this look right?",
+            "appt_details": {"Date": "5/27", "Specialty": "Dentist"},
+        }
+    )
+
+    prompt_text = "\n".join(message.content for batch in captured for message in batch)
+    assert command.goto == "send_user_confirmation"
+    assert command.update["appt_details"]["Provider"] == "Jonas Salk"
+    assert "- Provider: Jonas Salk" in command.update["appt_draft"]
+    assert "not specified" not in command.update["appt_draft"]
+    assert "- Provider: <provider>" in prompt_text
+    assert "Only include bullet lines for fields with real values" in prompt_text
+    assert "Use an empty string for missing values" in prompt_text
 
 
 def test_store_user_location_stores_top_level_location_and_ends(monkeypatch):
@@ -553,6 +761,7 @@ def test_classify_intent_still_interrupts_without_seed_flag(monkeypatch):
 def _booking_state():
     return {
         "chat_id": "888",
+        "nexhealth_institution_subdomain": "green-river-dental",
         "nexhealth_location_id": 1,
         "nexhealth_provider_id": 2,
         "nexhealth_patient_id": 3,
@@ -589,6 +798,316 @@ def test_send_provider_options_shows_provider_names_only(monkeypatch):
     assert sent[-1]["keyboard"] == [["1. Jonas Salk"], ["2. Albert Einstein"], ["Cancel"]]
     assert "ID" not in sent[-1]["text"]
     assert "488169621" not in sent[-1]["text"]
+
+
+def test_get_institution_with_missing_practice_routes_to_options_even_single(monkeypatch):
+    calls = []
+
+    def fake_request(*args, **kwargs):
+        calls.append(kwargs)
+        return (
+            {
+                "data": [
+                    {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                ]
+            },
+            {"nexhealth_bearer_token": "token"},
+        )
+
+    monkeypatch.setattr(nodes, "_nexhealth_request", fake_request)
+
+    command = nodes.get_institution(
+        {
+            "chat_id": "888",
+            "appt_details": {"Practice": "", "Location": "Austin"},
+        }
+    )
+
+    assert calls[0]["include_subdomain"] is False
+    assert command.goto == "send_institution_options"
+    assert command.update["nexhealth_bearer_token"] == "token"
+    assert command.update["nexhealth_institution_options"] == [
+        {
+            "id": 100,
+            "label": "Green River Dental",
+            "subdomain": "green-river-dental",
+            "record": {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+        }
+    ]
+    assert command.update["nexhealth_institution_warning"] == ""
+
+
+def test_get_institution_with_practice_match_skips_prompt(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                    {"id": 200, "name": "North Clinic", "subdomain": "north-clinic"},
+                ]
+            },
+            {},
+        ),
+    )
+
+    command = nodes.get_institution(
+        {
+            "chat_id": "888",
+            "appt_details": {"Practice": "Green River Dental", "Location": "Austin"},
+        }
+    )
+
+    assert command.goto == "get_location"
+    assert command.update["nexhealth_institution_id"] == 100
+    assert command.update["nexhealth_institution_subdomain"] == "green-river-dental"
+
+
+def test_get_institution_with_unavailable_practice_warns_and_routes_to_options(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                ]
+            },
+            {},
+        ),
+    )
+
+    command = nodes.get_institution(
+        {
+            "chat_id": "888",
+            "appt_details": {"Practice": "Other Dental", "Location": "Austin"},
+        }
+    )
+
+    assert command.goto == "send_institution_options"
+    assert command.update["nexhealth_institution_warning"] == (
+        "That institution isn't available. Would you like to book from one of these options?"
+    )
+
+
+def test_send_institution_options_shows_warning_and_buttons(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_institution_options(
+        {
+            "chat_id": "888",
+            "nexhealth_institution_warning": "That institution isn't available. Would you like to book from one of these options?",
+            "nexhealth_institution_options": [
+                {
+                    "id": 100,
+                    "label": "Green River Dental",
+                    "subdomain": "green-river-dental",
+                    "record": {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                }
+            ],
+        }
+    )
+
+    assert command.goto == "select_institution"
+    assert sent[-1]["text"].startswith("That institution isn't available")
+    assert "1. Green River Dental" in sent[-1]["text"]
+    assert sent[-1]["keyboard"] == [["1. Green River Dental"], ["Cancel"]]
+
+
+def test_select_institution_accepts_numeric_choice(monkeypatch):
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: {"text": "1", "update_id": 30})
+
+    command = nodes.select_institution(
+        {
+            "chat_id": "888",
+            "nexhealth_institution_options": [
+                {
+                    "id": 100,
+                    "label": "Green River Dental",
+                    "subdomain": "green-river-dental",
+                    "record": {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                }
+            ],
+        }
+    )
+
+    assert command.goto == "get_location"
+    assert command.update["nexhealth_institution_id"] == 100
+    assert command.update["nexhealth_institution_subdomain"] == "green-river-dental"
+
+
+def test_select_institution_invalid_choice_reprompts_then_cancel(monkeypatch):
+    sent = []
+    replies = iter([
+        {"text": "not that one", "update_id": 30},
+        {"text": "cancel", "update_id": 31},
+    ])
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: next(replies))
+
+    command = nodes.select_institution(
+        {
+            "chat_id": "888",
+            "nexhealth_institution_options": [
+                {
+                    "id": 100,
+                    "label": "Green River Dental",
+                    "subdomain": "green-river-dental",
+                    "record": {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                }
+            ],
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert command.update["conversation_status"] == "cancelled"
+    assert any("I did not recognize that institution" in message["text"] for message in sent)
+
+
+def test_nexhealth_request_uses_selected_subdomain_and_omits_for_institutions(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def json(self):
+            return {"data": []}
+
+    monkeypatch.setattr(nodes, "_ensure_nexhealth_token", lambda state: ("token", {}))
+    monkeypatch.setattr(nodes.httpx, "request", lambda *args, **kwargs: calls.append(kwargs) or FakeResponse())
+
+    nodes._nexhealth_request(
+        {"nexhealth_institution_subdomain": "green-river-dental"},
+        "GET",
+        "/locations",
+        params={"inactive": False},
+    )
+    nodes._nexhealth_request(
+        {"nexhealth_institution_subdomain": "green-river-dental"},
+        "GET",
+        "/institutions",
+        include_subdomain=False,
+    )
+
+    assert calls[0]["params"]["subdomain"] == "green-river-dental"
+    assert calls[0]["params"]["inactive"] is False
+    assert "subdomain" not in calls[1]["params"]
+
+
+def test_appointment_booking_key_includes_institution_subdomain():
+    base = {
+        "chat_id": "888",
+        "patient_id": 3,
+        "location_id": 1,
+        "provider_id": 2,
+        "appointment_type_id": 4,
+        "start_time": "2026-05-26T09:00:00-04:00",
+        "operatory_id": 5,
+    }
+
+    green_river_key = nodes.appointment_booking_key(
+        **base,
+        institution_subdomain="green-river-dental",
+    )
+    north_clinic_key = nodes.appointment_booking_key(
+        **base,
+        institution_subdomain="north-clinic",
+    )
+
+    assert green_river_key != north_clinic_key
+
+
+def test_get_location_with_missing_practice_routes_to_location_options(monkeypatch):
+    monkeypatch.delenv("NEXHEALTH_LOCATION_ID", raising=False)
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 10, "name": "North Clinic", "city": "Austin"},
+                    {"id": 20, "name": "South Clinic", "city": "Austin"},
+                ]
+            },
+            {"nexhealth_bearer_token": "token"},
+        ),
+    )
+
+    command = nodes.get_location(
+        {
+            "chat_id": "888",
+            "appt_details": {"Practice": "", "Location": "Austin"},
+        }
+    )
+
+    assert command.goto == "send_location_options"
+    assert command.update["nexhealth_bearer_token"] == "token"
+    assert command.update["nexhealth_location_options"] == [
+        {
+            "id": 10,
+            "label": "North Clinic Austin",
+            "record": {"id": 10, "name": "North Clinic", "city": "Austin"},
+        },
+        {
+            "id": 20,
+            "label": "South Clinic Austin",
+            "record": {"id": 20, "name": "South Clinic", "city": "Austin"},
+        },
+    ]
+
+
+def test_get_location_with_practice_match_skips_location_prompt(monkeypatch):
+    monkeypatch.delenv("NEXHEALTH_LOCATION_ID", raising=False)
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 10, "name": "North Clinic", "city": "Austin"},
+                    {"id": 20, "name": "South Clinic", "city": "Austin"},
+                ]
+            },
+            {},
+        ),
+    )
+
+    command = nodes.get_location(
+        {
+            "chat_id": "888",
+            "appt_details": {"Practice": "South Clinic", "Location": "Austin"},
+        }
+    )
+
+    assert command.goto == "get_provider"
+    assert command.update["nexhealth_location_id"] == 20
+
+
+def test_send_location_options_shows_practice_location_names_only(monkeypatch):
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_location_options(
+        {
+            "chat_id": "888",
+            "nexhealth_location_options": nodes._choice_options(
+                [
+                    {"id": 10, "name": "North Clinic", "city": "Austin"},
+                    {"id": 20, "name": "South Clinic", "city": "Austin"},
+                ]
+            ),
+        }
+    )
+
+    assert command.goto == "select_location"
+    assert "1. North Clinic Austin" in sent[-1]["text"]
+    assert "2. South Clinic Austin" in sent[-1]["text"]
+    assert sent[-1]["keyboard"] == [["1. North Clinic Austin"], ["2. South Clinic Austin"], ["Cancel"]]
+    assert "ID" not in sent[-1]["text"]
+    assert "10" not in sent[-1]["text"]
 
 
 def test_send_appointment_type_options_shows_titles_only(monkeypatch):
@@ -695,6 +1214,29 @@ def test_select_provider_invalid_choice_reprompts_then_cancel(monkeypatch):
     assert any("I did not recognize that provider" in message["text"] for message in sent)
 
 
+def test_select_location_invalid_choice_reprompts_then_cancel(monkeypatch):
+    sent = []
+    replies = iter([
+        {"text": "not that one", "update_id": 30},
+        {"text": "cancel", "update_id": 31},
+    ])
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: next(replies))
+
+    command = nodes.select_location(
+        {
+            "chat_id": "888",
+            "nexhealth_location_options": [
+                {"id": 10, "label": "North Clinic", "record": {"id": 10, "name": "North Clinic"}}
+            ],
+        }
+    )
+
+    assert command.goto == nodes.END
+    assert command.update["conversation_status"] == "cancelled"
+    assert any("I did not recognize that practice location" in message["text"] for message in sent)
+
+
 def test_get_appointment_slots_empty_result_offers_recovery(monkeypatch):
     sent = []
     monkeypatch.setattr(
@@ -782,6 +1324,7 @@ def test_book_appointment_skips_nexhealth_when_booking_already_booked(monkeypatc
 def test_book_appointment_marks_normalized_booking_success(monkeypatch):
     sent = []
     marked = []
+    reservations = []
     monkeypatch.setattr(
         nodes,
         "_model",
@@ -790,7 +1333,7 @@ def test_book_appointment_marks_normalized_booking_success(monkeypatch):
     monkeypatch.setattr(
         nodes,
         "reserve_appointment_booking",
-        lambda **kwargs: {"should_book": True, "status": "pending"},
+        lambda **kwargs: reservations.append(kwargs) or {"should_book": True, "status": "pending"},
     )
     monkeypatch.setattr(
         nodes,
@@ -816,6 +1359,7 @@ def test_book_appointment_marks_normalized_booking_success(monkeypatch):
 
     assert command.goto == nodes.END
     assert command.update["appointment_booking_status"] == "booked"
+    assert reservations[0]["details"]["institution_subdomain"] == "green-river-dental"
     assert marked[0]["nexhealth_appointment_id"] == "12345"
     assert sent[-1]["text"].startswith("Booked your appointment")
     assert "Tuesday, May 26 at 9:00 AM" in sent[-1]["text"]

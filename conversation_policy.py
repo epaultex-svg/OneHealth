@@ -77,6 +77,32 @@ def _is_general_response_phrase(text: str) -> bool:
     return stripped in acknowledgements or stripped.startswith(small_talk_prefixes)
 
 
+def _is_generic_appointment_request(text: str) -> bool:
+    stripped = text.strip(" \t\n\r.!?")
+    generic_requests = {
+        "can you make an appointment for me",
+        "can you book an appointment for me",
+        "can you schedule an appointment for me",
+        "could you make an appointment for me",
+        "could you book an appointment for me",
+        "could you schedule an appointment for me",
+        "please make an appointment for me",
+        "please book an appointment for me",
+        "please schedule an appointment for me",
+        "make an appointment for me",
+        "book an appointment for me",
+        "schedule an appointment for me",
+        "book me an appointment",
+        "schedule me an appointment",
+        "make me an appointment",
+        "i need an appointment",
+        "i want an appointment",
+        "i would like an appointment",
+        "i'd like an appointment",
+    }
+    return stripped in generic_requests
+
+
 def requested_profile_fields(text: str) -> tuple[list[str], list[str], bool]:
     """Return requested fields, sensitive fields explicitly requested, categories flag."""
     fields: list[str] = []
@@ -204,6 +230,19 @@ def deterministic_turn_for_message(msg: dict[str, Any], state: dict[str, Any]) -
             "decision": None,
             "safety_flags": [],
             "reason": "small_talk_or_acknowledgement",
+        }
+
+    if _is_generic_appointment_request(text):
+        return {
+            "intent": "clarify",
+            "confidence": 1.0,
+            "action": "clarify",
+            "requested_fields": [],
+            "missing_fields": ["appointment_type_or_reason", "preferred_date"],
+            "appointment_action": "book",
+            "decision": None,
+            "safety_flags": [],
+            "reason": "generic_appointment_request_missing_details",
         }
 
     return None

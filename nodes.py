@@ -55,9 +55,11 @@ from conversation import (
     greeting_text,
     help_text,
     no_appointment_types_text,
+    no_institutions_text,
     no_locations_text,
     no_providers_text,
     no_slots_text,
+    institution_unavailable_text,
     onboarding_ready_text,
     patient_info_prompt,
     patient_privacy_text,
@@ -168,8 +170,8 @@ def _nexhealth_base_url() -> str:
     return os.getenv("NEXHEALTH_API_BASE", "https://nexhealth.info").rstrip("/")
 
 
-def _nexhealth_subdomain() -> str:
-    subdomain = os.getenv("NEXHEALTH_SUBDOMAIN")
+def _nexhealth_subdomain(state: OneHealthAgentState | None = None) -> str:
+    subdomain = _clean((state or {}).get("nexhealth_institution_subdomain")) or os.getenv("NEXHEALTH_SUBDOMAIN")
     if not subdomain:
         raise RuntimeError("Missing NEXHEALTH_SUBDOMAIN")
     return subdomain
@@ -234,9 +236,10 @@ def _nexhealth_request(
     *,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
+    include_subdomain: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     token, token_update = _ensure_nexhealth_token(state)
-    merged_params = {"subdomain": _nexhealth_subdomain()}
+    merged_params = {"subdomain": _nexhealth_subdomain(state)} if include_subdomain else {}
     if params:
         merged_params.update(params)
 
@@ -385,6 +388,21 @@ def _appointment_type_label(record: dict[str, Any]) -> str:
     return next((_clean(bit) for bit in bits if _clean(bit)), _record_label(record))
 
 
+def _institution_label(record: dict[str, Any]) -> str:
+    return next(
+        (
+            _clean(record.get(key))
+            for key in ("name", "display_name", "institution_name", "subdomain")
+            if _clean(record.get(key))
+        ),
+        _record_label(record),
+    )
+
+
+def _institution_subdomain(record: dict[str, Any]) -> str:
+    return _clean(record.get("subdomain") or record.get("institution_subdomain"))
+
+
 def _record_search_text(record: dict[str, Any]) -> str:
     nested = []
     for value in record.values():
@@ -435,6 +453,19 @@ def _choice_options(
     ]
 
 
+def _institution_options(records: list[dict[str, Any]]) -> list[NexHealthOption]:
+    options: list[NexHealthOption] = []
+    for option in _choice_options(records, _institution_label):
+        record = option.get("record")
+        if not isinstance(record, dict):
+            continue
+        subdomain = _institution_subdomain(record)
+        if subdomain:
+            option["subdomain"] = subdomain
+            options.append(option)
+    return options
+
+
 def _options_text(title: str, options: list[NexHealthOption]) -> str:
     return choice_text(title, [_clean(option.get("label")) for option in options])
 
@@ -465,8 +496,40 @@ def _select_option_from_resume(
     selected_record = _match_record(records, text)
     if not selected_record:
         return None
+    for option in options:
+        if option.get("record") is selected_record:
+            return option
     selected_id = _record_id(selected_record)
     return next((option for option in options if option.get("id") == selected_id), None)
+
+
+def _select_option_or_cancel(
+    state: OneHealthAgentState,
+    *,
+    options: list[NexHealthOption],
+    kind: str,
+    prompt: str,
+    retry_prompt: str,
+) -> NexHealthOption | None:
+    selected = None
+    while selected is None:
+        resume = interrupt({
+            "chat_id": state.get("chat_id"),
+            "prompt": prompt,
+            "options": [
+                {"index": index, "id": option.get("id"), "label": option.get("label")}
+                for index, option in enumerate(options, start=1)
+            ],
+        })
+        text = _resume_text(resume, state)
+        if is_cancel_text(text):
+            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
+            return None
+        selected = _select_option_from_resume(resume, state, options)
+        prompt = retry_prompt
+        if selected is None:
+            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text(kind)})
+    return selected
 
 
 def _resume_text(resume: object, state: OneHealthAgentState) -> str:
@@ -1143,10 +1206,10 @@ def draft_appointment_details(
     extract_system = (
         "Extract structured appointment details from the user's message. "
         "Use saved location/insurance when the user did not specify a value. "
-        "Use 'not specified' if neither is available.\n\n"
+        "Use an empty string when a value is missing.\n\n"
         f"Saved user location: {saved_location}\n"
         f"Saved user insurance: {saved_insurance}\n\n"
-        "Return all fields: Date, Specialty, Practice, Reason, Insurance, Location."
+        "Return all fields: Date, Specialty, Provider, Practice, Reason, Insurance, Location."
     )
     extractor = _model().with_structured_output(AppointmentDetails)
     details: AppointmentDetails = extractor.invoke([
@@ -1332,10 +1395,12 @@ def correct_info(
             "Okay, updated...\n"
             "- Date: <date>\n"
             "- Specialty: <specialty>\n"
+            "- Provider: <provider>\n"
             "- Practice: <practice>\n"
             "- Reason: <reason>\n"
             "- Insurance: <insurance>\n"
             "- Location: <location>\n"
+            "Only include bullet lines for fields with real values. Do not write not specified.\n"
             "Does this look right?"
         )
     else:
@@ -1358,13 +1423,12 @@ def correct_info(
 
     update: dict = {"user_message_content": correction_text}
     if intent == "appointment":
-        update["appt_draft"] = revised
         current_details = state.get("appt_details") or {}
         extract_system = (
             "Apply the user's correction to the appointment details. "
             f"Current details: {current_details}\n\n"
-            "Return merged details for all fields: Date, Specialty, Practice, "
-            "Reason, Insurance, Location. Use 'not specified' for missing values."
+            "Return merged details for all fields: Date, Specialty, Provider, "
+            "Practice, Reason, Insurance, Location. Use an empty string for missing values."
         )
         extractor = _model().with_structured_output(AppointmentDetails)
         details: AppointmentDetails = extractor.invoke([
@@ -1372,6 +1436,7 @@ def correct_info(
             HumanMessage(content=correction_text),
         ])
         update["appt_details"] = details
+        update["appt_draft"] = appointment_confirmation_text(details)
     else:
         update["user_info_draft"] = revised
         current = state.get("user_info_extracted") or {}
@@ -1411,17 +1476,142 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
 
     return Command(goto=END)
 
-def start_nexhealth_scheduling(state: OneHealthAgentState) -> Command[Literal["get_location"]]:
+def start_nexhealth_scheduling(state: OneHealthAgentState) -> Command[Literal["get_institution"]]:
     """Start confirmed NexHealth scheduling workflow."""
     send_message.invoke({
         "chat_id": state["chat_id"],
         "text": scheduling_loading_text(),
         "remove_keyboard": True,
     })
-    return Command(goto="get_location")
+    return Command(goto="get_institution")
 
 
-def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", "__end__"]]:
+def get_institution(state: OneHealthAgentState) -> Command[Literal["send_institution_options", "get_location", "__end__"]]:
+    """Retrieve and store selected NexHealth institution subdomain."""
+    if state.get("nexhealth_institution_subdomain"):
+        return Command(goto="get_location")
+
+    payload, token_update = _nexhealth_request(
+        state,
+        "GET",
+        "/institutions",
+        include_subdomain=False,
+    )
+    institutions = [
+        record
+        for record in _extract_items(payload, "institutions")
+        if _institution_subdomain(record)
+    ]
+    if not institutions:
+        text, errors = _write_validated_text(
+            "no_results",
+            {
+                "current_search": "NexHealth institutions",
+                "allowed_recovery_actions": ["check the clinic setup", "try again later"],
+            },
+            no_institutions_text(),
+        )
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": text,
+        })
+        return Command(update={**token_update, "message_validation_errors": errors}, goto=END)
+
+    appt_details = state.get("appt_details") or {}
+    practice = _clean(appt_details.get("Practice"))
+    selected = _match_record(institutions, practice) if not _is_missing(practice) else None
+    if selected is not None:
+        subdomain = _institution_subdomain(selected)
+        update: dict[str, Any] = {
+            **token_update,
+            "nexhealth_institution_subdomain": subdomain,
+        }
+        institution_id = _record_id(selected)
+        if institution_id is not None:
+            update["nexhealth_institution_id"] = institution_id
+        return Command(update=update, goto="get_location")
+
+    options = _institution_options(institutions)
+    if not options:
+        text, errors = _write_validated_text(
+            "no_results",
+            {
+                "current_search": "NexHealth institutions with subdomains",
+                "allowed_recovery_actions": ["check the clinic setup", "try again later"],
+            },
+            no_institutions_text(),
+        )
+        send_message.invoke({
+            "chat_id": state["chat_id"],
+            "text": text,
+        })
+        return Command(update={**token_update, "message_validation_errors": errors}, goto=END)
+
+    warning = institution_unavailable_text() if not _is_missing(practice) else ""
+    return Command(
+        update={
+            **token_update,
+            "nexhealth_institution_options": options,
+            "nexhealth_institution_warning": warning,
+        },
+        goto="send_institution_options",
+    )
+
+
+def send_institution_options(state: OneHealthAgentState) -> Command[Literal["select_institution"]]:
+    """Send institution options to Telegram before pausing for selection."""
+    options = state.get("nexhealth_institution_options") or []
+    if not options:
+        raise RuntimeError("Cannot send institution options without nexhealth_institution_options")
+
+    text = _options_text("Choose an institution.", options)
+    warning = _clean(state.get("nexhealth_institution_warning"))
+    if warning:
+        text = f"{warning}\n\n{text}"
+
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": text,
+        "keyboard": _options_keyboard(options),
+    })
+    return Command(goto="select_institution")
+
+
+def select_institution(state: OneHealthAgentState) -> Command[Literal["get_location", "__end__"]]:
+    """Pause for institution selection and store selected subdomain."""
+    options = state.get("nexhealth_institution_options") or []
+    if not options:
+        raise RuntimeError("Cannot select institution without nexhealth_institution_options")
+
+    selected = _select_option_or_cancel(
+        state,
+        options=options,
+        kind="institution",
+        prompt="Which institution number do you want?",
+        retry_prompt="Please reply with one of the listed institution numbers.",
+    )
+    if selected is None:
+        return Command(update={"conversation_status": "cancelled"}, goto=END)
+
+    subdomain = _clean(selected.get("subdomain"))
+    if not subdomain:
+        record = selected.get("record")
+        if isinstance(record, dict):
+            subdomain = _institution_subdomain(record)
+    if not subdomain:
+        raise RuntimeError(f"Selected NexHealth institution option missing subdomain: {selected}")
+
+    update: dict[str, Any] = {
+        "nexhealth_institution_subdomain": subdomain,
+        "nexhealth_institution_warning": "",
+    }
+    institution_id = selected.get("id")
+    if institution_id is not None:
+        update["nexhealth_institution_id"] = institution_id
+    return Command(update=update, goto="get_location")
+
+
+def get_location(state: OneHealthAgentState) -> Command[Literal["send_location_options", "get_provider", "__end__"]]:
     """Retrieve and store selected NexHealth location ID."""
     env_location_id = os.getenv("NEXHEALTH_LOCATION_ID")
     if env_location_id:
@@ -1454,25 +1644,20 @@ def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", 
         selected = locations[0]
     else:
         appt_details = state.get("appt_details") or {}
-        selected = _match_record(locations, _clean(appt_details.get("Location")))
+        practice = _clean(appt_details.get("Practice"))
+        if not _is_missing(practice):
+            desired = " ".join([
+                practice,
+                _clean(appt_details.get("Location")),
+            ])
+            selected = _match_record(locations, desired)
 
-    while selected is None:
-        location_options = _choice_options(locations)
-        send_message.invoke({
-            "chat_id": state["chat_id"],
-            "text": _options_text("Choose a location.", location_options),
-            "keyboard": _options_keyboard(location_options),
-        })
-        resume = interrupt({
-            "chat_id": state.get("chat_id"),
-            **_choice_prompt("Choose a NexHealth location.", locations),
-        })
-        if is_cancel_text(_resume_text(resume, state)):
-            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
-            return Command(update={**token_update, "conversation_status": "cancelled"}, goto=END)
-        selected = _select_record_from_resume(resume, state, locations)
-        if selected is None:
-            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("location")})
+    if selected is None:
+        options = _choice_options(locations)
+        return Command(
+            update={**token_update, "nexhealth_location_options": options},
+            goto="send_location_options",
+        )
 
     location_id = _record_id(selected)
     if location_id is None:
@@ -1482,6 +1667,42 @@ def get_location(state: OneHealthAgentState) -> Command[Literal["get_provider", 
         update={**token_update, "nexhealth_location_id": location_id},
         goto="get_provider",
     )
+
+
+def send_location_options(state: OneHealthAgentState) -> Command[Literal["select_location"]]:
+    """Send practice location options to Telegram before pausing for selection."""
+    options = state.get("nexhealth_location_options") or []
+    if not options:
+        raise RuntimeError("Cannot send location options without nexhealth_location_options")
+    send_message.invoke({
+        "chat_id": state["chat_id"],
+        "text": _options_text("Choose a practice location.", options),
+        "keyboard": _options_keyboard(options),
+    })
+    return Command(goto="select_location")
+
+
+def select_location(state: OneHealthAgentState) -> Command[Literal["get_provider", "__end__"]]:
+    """Pause for practice location selection and store location ID."""
+    options = state.get("nexhealth_location_options") or []
+    if not options:
+        raise RuntimeError("Cannot select location without nexhealth_location_options")
+
+    selected = _select_option_or_cancel(
+        state,
+        options=options,
+        kind="practice location",
+        prompt="Which practice location number do you want?",
+        retry_prompt="Please reply with one of the listed practice location numbers.",
+    )
+    if selected is None:
+        return Command(update={"conversation_status": "cancelled"}, goto=END)
+
+    location_id = selected.get("id")
+    if location_id is None:
+        raise RuntimeError(f"Selected NexHealth location option missing id: {selected}")
+
+    return Command(update={"nexhealth_location_id": location_id}, goto="get_provider")
 
 
 def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_options", "get_patient", "__end__"]]:
@@ -1524,6 +1745,7 @@ def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_o
         appt_details = state.get("appt_details") or {}
         desired = " ".join([
             state.get("user_message_content", ""),
+            _clean(appt_details.get("Provider")),
             _clean(appt_details.get("Practice")),
             _clean(appt_details.get("Specialty")),
             _clean(appt_details.get("Reason")),
@@ -1566,25 +1788,15 @@ def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"
     if not options:
         raise RuntimeError("Cannot select provider without nexhealth_provider_options")
 
-    selected = None
-    prompt = "Which provider number do you want?"
-    while selected is None:
-        resume = interrupt({
-            "chat_id": state.get("chat_id"),
-            "prompt": prompt,
-            "options": [
-                {"index": index, "id": option.get("id"), "label": option.get("label")}
-                for index, option in enumerate(options, start=1)
-            ],
-        })
-        text = _resume_text(resume, state)
-        if is_cancel_text(text):
-            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
-            return Command(update={"conversation_status": "cancelled"}, goto=END)
-        selected = _select_option_from_resume(resume, state, options)
-        prompt = "Please reply with one of the listed provider numbers."
-        if selected is None:
-            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("provider")})
+    selected = _select_option_or_cancel(
+        state,
+        options=options,
+        kind="provider",
+        prompt="Which provider number do you want?",
+        retry_prompt="Please reply with one of the listed provider numbers.",
+    )
+    if selected is None:
+        return Command(update={"conversation_status": "cancelled"}, goto=END)
 
     provider_id = selected.get("id")
     if provider_id is None:
@@ -1779,25 +1991,15 @@ def select_appointment_type(state: OneHealthAgentState) -> Command[Literal["get_
     if not options:
         raise RuntimeError("Cannot select appointment type without nexhealth_appointment_type_options")
 
-    selected = None
-    prompt = "Which appointment type number do you want?"
-    while selected is None:
-        resume = interrupt({
-            "chat_id": state.get("chat_id"),
-            "prompt": prompt,
-            "options": [
-                {"index": index, "id": option.get("id"), "label": option.get("label")}
-                for index, option in enumerate(options, start=1)
-            ],
-        })
-        text = _resume_text(resume, state)
-        if is_cancel_text(text):
-            send_message.invoke({"chat_id": state["chat_id"], "text": cancelled_text(), "remove_keyboard": True})
-            return Command(update={"conversation_status": "cancelled"}, goto=END)
-        selected = _select_option_from_resume(resume, state, options)
-        prompt = "Please reply with one of the listed appointment type numbers."
-        if selected is None:
-            send_message.invoke({"chat_id": state["chat_id"], "text": invalid_choice_text("appointment type")})
+    selected = _select_option_or_cancel(
+        state,
+        options=options,
+        kind="appointment type",
+        prompt="Which appointment type number do you want?",
+        retry_prompt="Please reply with one of the listed appointment type numbers.",
+    )
+    if selected is None:
+        return Command(update={"conversation_status": "cancelled"}, goto=END)
 
     appointment_type_id = selected.get("id")
     if appointment_type_id is None:
@@ -1934,12 +2136,14 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     start_time = _slot_time(slot)
     readable_start_time = _readable_datetime(start_time)
     operatory_id = slot.get("operatory_id")
+    institution_subdomain = _nexhealth_subdomain(state)
 
     if None in (location_id, provider_id, patient_id, appointment_type_id) or not start_time or operatory_id is None:
         raise RuntimeError("Cannot book NexHealth appointment without patient/provider/type/slot details")
 
     booking_key = appointment_booking_key(
         chat_id=chat_id,
+        institution_subdomain=institution_subdomain,
         patient_id=int(patient_id),
         location_id=int(location_id),
         provider_id=int(slot.get("provider_id") or provider_id),
@@ -1959,6 +2163,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
     persisted_details = {
         "appointment_details": state.get("appt_details") or {},
         "patient_id": patient_id,
+        "institution_subdomain": institution_subdomain,
         "provider_id": provider_id,
         "location_id": location_id,
         "appointment_type_id": appointment_type_id,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from conversation import appointment_confirmation_text, profile_confirmation_text
+from conversation import appointment_confirmation_text, appointment_detail_items, profile_confirmation_text
 from conversation_models import MessageDraft, MessageValidation, ValidationFailure
 
 
@@ -34,9 +34,6 @@ SIDE_EFFECT_CLAIMS = {
     "retrieved your": "retrieved_profile",
 }
 
-APPOINTMENT_CONFIRMATION_FIELDS = ("date", "specialty", "practice", "reason", "insurance", "location")
-
-
 def _lower_text(draft: MessageDraft | dict[str, Any]) -> str:
     return str(draft.get("text", "") or "").strip().lower()
 
@@ -57,7 +54,7 @@ def validate_generated_message(
 
     _check_side_effect_claims(text, route, context, errors)
     _check_sensitive_values(text, route, context, errors)
-    _check_required_fields(text, route, errors)
+    _check_required_fields(text, route, context, errors)
 
     deduped = list(dict.fromkeys(errors))
     return {
@@ -123,11 +120,22 @@ def _check_sensitive_values(
         errors.append("phi_overexposure")
 
 
-def _check_required_fields(text: str, route: str, errors: list[ValidationFailure]) -> None:
+def _check_required_fields(
+    text: str,
+    route: str,
+    context: dict[str, Any],
+    errors: list[ValidationFailure],
+) -> None:
     if route != "appointment_confirmation":
         return
-    missing = [field for field in APPOINTMENT_CONFIRMATION_FIELDS if field not in text]
-    if missing:
+    has_confirmation_language = "confirm" in text or "does this look right" in text
+    details = context.get("appointment_details") or {}
+    known_items = appointment_detail_items(details)
+    has_known_field = any(
+        field.lower() in text and value.lower() in text
+        for field, value in known_items
+    )
+    if not has_confirmation_language or not has_known_field:
         errors.append("missing_required_info")
 
 

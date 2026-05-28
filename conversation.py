@@ -37,7 +37,7 @@ CONVERSATION_STATE_TABLE: list[ConversationStateSpec] = [
     {
         "step": "appointment_confirmation",
         "loading": "Draft extracted appointment details.",
-        "empty": "Missing values are shown as not specified.",
+        "empty": "Missing values are omitted from confirmation.",
         "error": "Denied confirmation asks what needs correction.",
         "success": "Confirmed details proceed to scheduling.",
         "retry": "Correction updates draft and asks again.",
@@ -53,6 +53,15 @@ CONVERSATION_STATE_TABLE: list[ConversationStateSpec] = [
         "cancel": "Cancel stops before Supabase write.",
     },
     {
+        "step": "institution_selection",
+        "loading": "Fetch NexHealth institutions before location/provider lookup.",
+        "empty": "No institutions means scheduling cannot continue.",
+        "error": "Invalid selection asks user to tap or reply with listed choice.",
+        "success": "Selected institution subdomain scopes NexHealth requests.",
+        "retry": "Send numbered choices again with Telegram buttons.",
+        "cancel": "Cancel stops before location or provider lookup.",
+    },
+    {
         "step": "provider_selection",
         "loading": "Fetch requestable providers from NexHealth.",
         "empty": "No providers message suggests changing location or request.",
@@ -60,6 +69,15 @@ CONVERSATION_STATE_TABLE: list[ConversationStateSpec] = [
         "success": "Selected provider ID stored.",
         "retry": "Send numbered choices again with Telegram buttons.",
         "cancel": "Cancel stops before patient lookup.",
+    },
+    {
+        "step": "practice_location_selection",
+        "loading": "Fetch active practice locations from NexHealth.",
+        "empty": "No active practice locations means scheduling cannot continue.",
+        "error": "Invalid selection asks user to tap or reply with listed choice.",
+        "success": "Selected practice location ID stored.",
+        "retry": "Send numbered choices again with Telegram buttons.",
+        "cancel": "Cancel stops before provider lookup.",
     },
     {
         "step": "appointment_type_selection",
@@ -173,17 +191,41 @@ def profile_privacy_text() -> str:
     )
 
 
+APPOINTMENT_CONFIRMATION_FIELD_ORDER = (
+    "Date",
+    "Specialty",
+    "Provider",
+    "Practice",
+    "Reason",
+    "Insurance",
+    "Location",
+)
+
+
+def _is_missing_appointment_value(value: Any) -> bool:
+    if value is None:
+        return True
+    normalized = str(value).strip().lower()
+    return not normalized or normalized in {"not specified", "unknown", "none", "n/a", "null"}
+
+
+def appointment_detail_items(details: dict[str, Any]) -> list[tuple[str, str]]:
+    return [
+        (field, str(details[field]).strip())
+        for field in APPOINTMENT_CONFIRMATION_FIELD_ORDER
+        if field in details and not _is_missing_appointment_value(details.get(field))
+    ]
+
+
 def appointment_confirmation_text(details: dict[str, Any]) -> str:
-    return (
-        "Confirm appointment details:\n"
-        f"- Date: {details.get('Date', 'not specified')}\n"
-        f"- Specialty: {details.get('Specialty', 'not specified')}\n"
-        f"- Practice: {details.get('Practice', 'not specified')}\n"
-        f"- Reason: {details.get('Reason', 'not specified')}\n"
-        f"- Insurance: {details.get('Insurance', 'not specified')}\n"
-        f"- Location: {details.get('Location', 'not specified')}\n"
-        "Does this look right?"
-    )
+    items = appointment_detail_items(details)
+    if not items:
+        return "I need a little more detail before confirming. What specialty, provider, date, or reason should I use?"
+
+    lines = ["Confirm appointment details:"]
+    lines.extend(f"- {field}: {value}" for field, value in items)
+    lines.append("Does this look right?")
+    return "\n".join(lines)
 
 
 def profile_confirmation_text(extracted: dict[str, Any]) -> str:
@@ -216,6 +258,14 @@ def scheduling_loading_text() -> str:
 
 def no_locations_text() -> str:
     return "I could not find active NexHealth locations. Check the clinic setup or try again later."
+
+
+def no_institutions_text() -> str:
+    return "I could not find available NexHealth institutions. Check the clinic setup or try again later."
+
+
+def institution_unavailable_text() -> str:
+    return "That institution isn't available. Would you like to book from one of these options?"
 
 
 def no_providers_text() -> str:
