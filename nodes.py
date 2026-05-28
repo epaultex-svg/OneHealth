@@ -23,7 +23,6 @@ from state import (
     NexHealthSlot,
     OneHealthAgentState,
     PatientInfo,
-    TextClassification,
     UserInfoExtracted,
 )
 from appointments import (
@@ -942,82 +941,6 @@ def onboard(state: OneHealthAgentState) -> Command[Literal["plan_next_turn", "__
     })
     return Command(update={"patient_info": patient_info}, goto="plan_next_turn")
 
-
-def _normalized_text(text: object) -> str:
-    return " ".join(str(text or "").strip().lower().split())
-
-
-def _is_general_response_phrase(text: str) -> bool:
-    stripped = text.strip(" \t\n\r.!?")
-    if not stripped:
-        return True
-
-    acknowledgements = {
-        "ok",
-        "okay",
-        "k",
-        "cool",
-        "great",
-        "awesome",
-        "perfect",
-        "sounds good",
-        "thank you",
-        "thanks",
-        "thx",
-        "ty",
-        "you are welcome",
-        "you're welcome",
-        "no problem",
-        "no worries",
-    }
-    small_talk_prefixes = (
-        "how are you",
-        "how are things",
-        "how is it going",
-        "how's it going",
-        "how have you been",
-        "hope you are",
-        "hope you're",
-        "nice to meet you",
-        "good to hear",
-        "glad to hear",
-        "i appreciate",
-    )
-
-    return stripped in acknowledgements or stripped.startswith(small_talk_prefixes)
-
-
-def _deterministic_classification(msg: dict[str, Any]) -> TextClassification | None:
-    text = _normalized_text(msg.get("user_message_content"))
-    if msg.get("location"):
-        return {
-            "intent": "location_update",
-            "confidence": 1.0,
-            "reason": "telegram_location_payload",
-        }
-    if text == "/add_location":
-        return {
-            "intent": "location_update",
-            "confidence": 1.0,
-            "reason": "explicit_location_command",
-        }
-    if text in {"hi", "hello", "hey", "good morning", "good afternoon", "good evening"}:
-        return {"intent": "greeting", "confidence": 1.0, "reason": "greeting_phrase"}
-    if text in {"help", "/help", "what can you do", "what can you help with"}:
-        return {"intent": "help", "confidence": 1.0, "reason": "help_phrase"}
-    if text in {
-        "about",
-        "/about",
-        "tell me about yourself",
-        "who are you",
-        "what are you",
-    }:
-        return {"intent": "about_assistant", "confidence": 1.0, "reason": "about_phrase"}
-    if _is_general_response_phrase(text):
-        return {"intent": "general_response", "confidence": 1.0, "reason": "small_talk_or_acknowledgement"}
-    if is_cancel_text(text):
-        return {"intent": "general_response", "confidence": 1.0, "reason": "top_level_cancel"}
-    return None
 
 def plan_next_turn(
     state: OneHealthAgentState,
