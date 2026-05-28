@@ -262,6 +262,7 @@ def test_classify_intent_routes_about_help_location_and_low_confidence(monkeypat
         ("Do you assist with orthodontist visits?", "general_info", "send_direct_response"),
         ("What kinds of pediatric dental appointments can OneHealth support?", "general_info", "send_direct_response"),
         ("Can OneHealth handle eye exam appointments?", "general_info", "send_direct_response"),
+        ("Can you update my insurance?", "general_info", "send_direct_response"),
         ("Book a dermatology appointment tomorrow.", "appointment", "draft_appointment_details"),
         ("Please schedule an orthodontist visit next week.", "appointment", "draft_appointment_details"),
         ("Set up a pediatric dental appointment for Friday.", "appointment", "draft_appointment_details"),
@@ -299,6 +300,7 @@ def test_classify_intent_prompt_distinguishes_capability_from_booking(
     assert command.goto == expected_goto
     assert command.update["user_message_classification"]["intent"] == expected_intent
     assert "Capability questions go general_info" in system_prompt
+    assert "concrete new values to store" in system_prompt
     assert "appointment_book" in system_prompt
     assert "retrieve_info" in system_prompt
     assert "ALLOWED_ACTIONS" in system_prompt
@@ -338,6 +340,44 @@ def test_send_direct_response_general_info_uses_safe_model(monkeypatch):
 
     assert command.goto == nodes.END
     assert sent[-1]["text"] == "I can help schedule appointments."
+
+
+def test_direct_response_prompt_affirms_profile_update_capability(monkeypatch):
+    sent = []
+    captured = []
+
+    class CapturingModel:
+        def invoke(self, messages):
+            captured.extend(messages)
+            return type(
+                "Response",
+                (),
+                {
+                    "content": (
+                        "Yes, I can help store your insurance details. Send the details "
+                        "and I will ask you to confirm before saving."
+                    )
+                },
+            )()
+
+    monkeypatch.setattr(nodes, "_model", lambda: CapturingModel())
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_direct_response(
+        {
+            "chat_id": "888",
+            "user_message_content": "can you update my insurance?",
+            "user_message_classification": {"intent": "general_info"},
+            "conversation_turn": {"intent": "general_info", "action": "direct_response"},
+        }
+    )
+
+    system_prompt = captured[0].content
+    assert command.goto == nodes.END
+    assert "Capability statements are allowed" in system_prompt
+    assert "store or update confirmed profile details, including insurance details" in system_prompt
+    assert "Do not imply any value has already been changed" in system_prompt
+    assert "I can help store your insurance details" in sent[-1]["text"]
 
 
 def test_send_direct_response_catch_all_uses_model(monkeypatch):

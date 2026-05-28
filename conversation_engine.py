@@ -26,12 +26,12 @@ Intent labels:
 - greeting: brief hello only.
 - help: asks what OneHealth can do or asks for examples.
 - about_assistant: asks who or what OneHealth is.
-- general_info: asks capability or workflow question without requesting action.
+- general_info: asks capability or workflow question without requesting action and/or providing sufficient details.
 - general_response: thanks, small talk, acknowledgement, unclear text, unsupported request.
 - retrieve_info: asks what OneHealth has saved, such as insurance, location, profile, patient details.
-- store_user_info: asks to remember, save, update, or correct profile/preferences.
+- store_user_info: provides concrete profile/preference values to remember, save, update, or correct.
 - location_update: shares location or asks to add/update location.
-- appointment_book: asks to book/schedule/create/reserve appointment.
+- appointment_book: asks to book/schedule/create/reserve appointment and provides sufficient details.
 - appointment_view: asks to see/list/check upcoming appointments.
 - appointment_reschedule: asks to move/change/reschedule existing appointment.
 - appointment_cancel: asks to cancel existing appointment.
@@ -49,6 +49,9 @@ Rules:
 - Cancel/stop/never mind always sets safety_flags=["cancel_requested"].
 - Telegram location payload always location_update.
 - Capability questions go general_info, not appointment_book.
+- Questions about whether OneHealth can update stored info, or how to update it, go general_info unless the message includes concrete new values to store.
+- Examples: "can you update my insurance?" -> direct_response. "remember my insurance is Aetna" -> store_user_info/store_user_info_draft. "can you book an appointment" -> direct_response
+"can you store info" -> direct_response
 - If confidence < 0.65, choose clarify.
 
 Output schema:
@@ -60,7 +63,8 @@ SHARED_WRITER_HEADER = """You are OneHealth, a Telegram assistant for healthcare
 
 Use only facts in PROVIDED_CONTEXT. Do not invent stored info, clinic availability, appointments, insurance, location, or booking status.
 Do not give diagnosis, treatment advice, medication advice, or emergency triage.
-Do not say anything was booked, cancelled, stored, updated, or retrieved unless PROVIDED_CONTEXT says it happened.
+Do not say anything was already booked, cancelled, stored, updated, or retrieved unless PROVIDED_CONTEXT says it happened.
+Capability statements are allowed: OneHealth can collect insurance/profile details and store them after explicit user confirmation.
 Before any booking or profile write, user must explicitly confirm.
 Keep replies short, warm, and clear. Telegram format. No markdown tables.
 """
@@ -71,6 +75,9 @@ WRITER_PROMPTS: dict[str, str] = {
 
 Allowed: greeting, help, capability explanation, small talk, unsupported request.
 Forbidden: database lookup, stored profile facts, booking claims, medical advice.
+For profile capability questions, say OneHealth can help store or update confirmed profile details, including insurance details, after the user sends the details and confirms.
+For appointment capability questions, say OneHealth can book, view, and reschedule appointments.
+Do not refuse supported profile storage/update requests. Do not imply any value has already been changed.
 Offer one useful next action only if natural.
 """,
     "retrieve_info": """Answer using only RETRIEVED_PROFILE fields.
