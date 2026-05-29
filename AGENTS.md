@@ -97,6 +97,7 @@ Defined in `nodes.py` and wired in `agent.py`:
 - `classify_intent`: LLM classifies message intent. Called when the turn planner needs intent before routing.
 - `store_user_location`: Persists a new user-provided Telegram location to Supabase.
 - `retrieve_info`: Returns saved profile fields or other stored data directly to the user.
+- `view_appointments`: Fetches and displays the user's upcoming NexHealth appointments. Collects patient info if not yet on file, searches NexHealth GET /appointments for the next 365 days, and formats each result with a readable date/time, provider name, and appointment type. Requires `NEXHEALTH_LOCATION_ID`. Retried up to 3 times on API failure.
 - `send_clarify`: Sends a clarification request when the user's intent is ambiguous.
 - `send_direct_response`: Sends a one-turn LLM-generated reply for greetings, help, about-assistant, small talk, and unsupported intents (view/reschedule/cancel appointments). Retried up to 3 times on send failure.
 
@@ -148,7 +149,8 @@ Defined in `nodes.py` and wired in `agent.py`:
 - User confirmation gates all writes that modify user profile data or book appointments.
 - Appointment booking now uses NexHealth API calls directly instead of Firecrawl search, Browserbase cookies, or Stagehand browser automation.
 - Institution and location selection are part of the booking flow. Single-option and env-override (`NEXHEALTH_LOCATION_ID`) cases skip user prompts entirely; multi-option cases send Telegram reply buttons.
-- Requests to view, reschedule, or cancel existing appointments (`appointment_view`, `appointment_reschedule`, `appointment_cancel`) are recognized by `plan_next_turn` and answered with a graceful "not available yet" message rather than failing silently or routing to an incomplete flow.
+- Appointment viewing (`appointment_view`) is implemented: routes to `view_appointments`, which fetches upcoming appointments from NexHealth GET /appointments and formats them for Telegram. Requires `NEXHEALTH_LOCATION_ID` to be configured.
+- Rescheduling and cancellation (`appointment_reschedule`, `appointment_cancel`) are recognized by `coerce_turn` and gracefully declined with a "not available yet" message via `send_direct_response`.
 - Location is optional for booking when `NEXHEALTH_LOCATION_ID` is configured, but first-time users are still asked for location to improve future results.
 - NexHealth patient demographics are collected before scheduling because booking requires patient identity fields.
 - Provider, appointment type, and slot selection support Telegram buttons, numeric choices, and record/ID matching.

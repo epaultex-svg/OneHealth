@@ -43,6 +43,16 @@ draft_user_info_storage_details
   -> store_in_supabase
 ```
 
+## Documentation
+
+| Document | Purpose |
+|----------|---------|
+| [README.md](README.md) | Setup, run commands, env vars, architecture overview |
+| [AGENTS.md](AGENTS.md) | Full node reference, state schema, tools, design decisions |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Why the system works this way — planner/writer/validator, interrupt pattern, NexHealth pipeline |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, adding new intents/nodes, validation rules, code style |
+| [evals/README.md](evals/README.md) | Running and uploading LangSmith evaluators |
+
 ## Core Files
 
 | File | Purpose |
@@ -162,7 +172,8 @@ Important: evaluation uses real graph code. The runner captures outbound Telegra
 - Invalid provider/type/slot replies send a specific retry message and do not advance.
 - Users can reply `Cancel` during confirmation, correction, patient-info collection, provider/type/slot/institution selection, or slot selection. Cancellation stops before side effects for that step.
 - Empty NexHealth results end safely with recovery actions: try another date, choose a different provider or appointment type, change request, or cancel.
-- Requests to view, reschedule, or cancel existing appointments are recognized and answered gracefully — those workflows are not yet implemented.
+- Viewing upcoming appointments is supported: the `appointment_view` intent routes to the `view_appointments` node, which fetches upcoming appointments from NexHealth and displays them. Requires `NEXHEALTH_LOCATION_ID` to be set.
+- Rescheduling and cancellation requests (`appointment_reschedule`, `appointment_cancel`) are recognized and answered gracefully — those workflows are not yet implemented.
 - All outbound messages render `**bold**` correctly in Telegram. The `send_message` helper HTML-escapes text and converts `**markers**` to `<b>` tags before sending with `parse_mode=HTML`.
 - Patient demographics, location, and insurance are sensitive. Production should also expose update/delete controls.
 
