@@ -106,6 +106,7 @@ class OneHealthAgentState(TypedDict, total=False):
     nexhealth_available_slots: list[NexHealthSlot]
     nexhealth_selected_slot: NexHealthSlot | None
     nexhealth_appointment_result: dict | None
+    viewed_appointments: list | None
     appointment_booking_key: str | None
     appointment_booking_status: str | None
 

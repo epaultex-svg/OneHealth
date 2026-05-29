@@ -107,6 +107,14 @@ Ask explicit yes/change/cancel question.
 Do not imply availability was checked.
 Do not say appointment is booked.
 """,
+    "view_appointments": """List the user's upcoming appointments.
+
+Use ONLY the entries in PROVIDED_CONTEXT.appointments. Reproduce each line's date/time text verbatim.
+If the list is empty, say there are no upcoming appointments and offer to book one.
+Do not invent, add, or omit appointments. Do not include raw IDs or API metadata.
+Phrase as "You have an upcoming appointment on ..." or "Your upcoming appointments:".
+Do not say any appointment was just booked, scheduled, cancelled, or updated.
+""",
     "clarify": """Ask one focused clarification question.
 
 Name what is missing or ambiguous.
