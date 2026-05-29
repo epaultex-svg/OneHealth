@@ -153,9 +153,10 @@ def fallback_message(route: str, context: dict[str, Any], errors: list[str] | No
 
     if route == "store_user_info_draft":
         extracted = context.get("extracted_fields") or {}
-        return profile_confirmation_text(extracted) if extracted else (
-            "Tell me the profile info to save. Example: Remember my insurance is Aetna."
-        )
+        saved_city = context.get("saved_city")
+        if extracted or saved_city:
+            return profile_confirmation_text(extracted, saved_city=saved_city)
+        return "Tell me the profile info to save. Example: Remember my insurance is Aetna."
 
     if route == "booking_success":
         booking_result = context.get("booking_result") or {}

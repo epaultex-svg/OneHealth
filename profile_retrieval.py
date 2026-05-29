@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from supabase import create_client
 
 from conversation_models import RetrievedProfile
+from tools import resolve_location_city
 
 load_dotenv()
 
@@ -35,6 +36,7 @@ def get_retrievable_profile(
     row = read_profile_row(chat_id)
     return sanitize_profile(
         row,
+        chat_id=chat_id,
         requested_fields=requested_fields or [],
         include_sensitive_fields=include_sensitive_fields or [],
         categories_only=categories_only,
@@ -44,6 +46,7 @@ def get_retrievable_profile(
 def sanitize_profile(
     row: dict[str, Any],
     *,
+    chat_id: str | None = None,
     requested_fields: list[str],
     include_sensitive_fields: list[str],
     categories_only: bool = False,
@@ -99,7 +102,7 @@ def sanitize_profile(
             if not location:
                 missing.append("location")
                 continue
-            fields["location"] = _summarize_location(location)
+            fields["location"] = _summarize_location(location, chat_id)
             continue
         if field == "patient_info":
             patient = row.get("patient_info")
@@ -129,12 +132,11 @@ def sanitize_profile(
     }
 
 
-def _summarize_location(location: dict[str, Any]) -> dict[str, Any]:
-    lat = location.get("lat", location.get("latitude"))
-    lng = location.get("lng", location.get("longitude"))
+def _summarize_location(location: dict[str, Any], chat_id: str | None = None) -> dict[str, Any]:
     summary: dict[str, Any] = {}
-    if lat is not None and lng is not None:
-        summary["coordinates"] = f"{float(lat):.4f}, {float(lng):.4f}"
+    city = resolve_location_city(chat_id, location) if chat_id else location.get("city")
+    if city:
+        summary["city"] = city
     if updated_at := location.get("updated_at"):
         summary["updated_at"] = updated_at
     return summary or {"saved": True}
