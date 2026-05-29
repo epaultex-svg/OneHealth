@@ -23,15 +23,16 @@ draft_appointment_details
   -> send_user_confirmation
   -> interpret_user_confirmation
   -> start_nexhealth_scheduling
-  -> get_location
-  -> get_provider
+  -> get_institution [-> send_institution_options -> select_institution]
+  -> get_location [-> send_location_options -> select_location]
+  -> get_provider [-> send_provider_options -> select_provider]
   -> get_patient
-  -> get_appointment_type
-  -> get_appointment_slots
-  -> send_slot_options
-  -> select_appointment_slot
+  -> get_appointment_type [-> send_appointment_type_options -> select_appointment_type]
+  -> get_appointment_slots -> send_slot_options -> select_appointment_slot
   -> book_appointment
 ```
+
+Bracketed branches only appear when auto-selection cannot resolve a single record. Institution and location auto-select when only one option exists or an env override is set (`NEXHEALTH_LOCATION_ID`).
 
 Preference storage path:
 
@@ -156,10 +157,13 @@ Important: evaluation uses real graph code. The runner captures outbound Telegra
 - Every appointment and profile update goes through a confirmation prompt before write or booking.
 - Users can deny confirmation, describe corrections, and review updated details.
 - Patient demographics and profile storage include privacy/consent copy before asking or storing.
+- Institution and NexHealth location selection present Telegram reply buttons when multiple options exist; single-option and env-override cases skip the prompt entirely.
 - Provider, appointment type, and slot pickers send Telegram reply buttons and still accept numeric replies plus some record/ID matches.
 - Invalid provider/type/slot replies send a specific retry message and do not advance.
-- Users can reply `Cancel` during confirmation, correction, patient-info collection, provider/type selection, or slot selection. Cancellation stops before side effects for that step.
+- Users can reply `Cancel` during confirmation, correction, patient-info collection, provider/type/slot/institution selection, or slot selection. Cancellation stops before side effects for that step.
 - Empty NexHealth results end safely with recovery actions: try another date, choose a different provider or appointment type, change request, or cancel.
+- Requests to view, reschedule, or cancel existing appointments are recognized and answered gracefully — those workflows are not yet implemented.
+- All outbound messages render `**bold**` correctly in Telegram. The `send_message` helper HTML-escapes text and converts `**markers**` to `<b>` tags before sending with `parse_mode=HTML`.
 - Patient demographics, location, and insurance are sensitive. Production should also expose update/delete controls.
 
 ## Telegram Webhook
