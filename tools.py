@@ -1,5 +1,7 @@
 import asyncio
+import html
 import os
+import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 import httpx
@@ -76,6 +78,12 @@ def read_message() -> dict:
     }
 
 
+def _to_telegram_html(text: str) -> str:
+    """HTML-escape text, then convert **bold** markers to <b> tags."""
+    escaped = html.escape(text, quote=False)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+
+
 @tool
 def send_message(
     chat_id: str,
@@ -100,7 +108,11 @@ def send_message(
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
 
-    payload: dict = {"chat_id": chat_id, "text": text}
+    payload: dict = {
+        "chat_id": chat_id,
+        "text": _to_telegram_html(text),
+        "parse_mode": "HTML",
+    }
     if web_app_url:
         payload["reply_markup"] = {
             "keyboard": [
