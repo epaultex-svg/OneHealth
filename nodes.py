@@ -70,6 +70,7 @@ from conversation import (
 from profile_retrieval import get_retrievable_profile
 from tools import (
     read_message,
+    resolve_location_city,
     send_message,
     store_info,
 )
@@ -1292,11 +1293,16 @@ def draft_appointment_details(
     saved_location = user_row.get("location") or {}
     saved_insurance = user_row.get("insurance") or {}
 
+    # Resolve the saved location to a city name so the model (and the user-facing
+    # confirmation) never sees raw lat/lng. Empty string when unresolvable -> the
+    # Location field stays empty and is dropped by the missing-field filter.
+    saved_city = resolve_location_city(chat_id, saved_location) or ""
+
     extract_system = (
         "Extract structured appointment details from the user's message. "
         "Use saved location/insurance when the user did not specify a value. "
         "Use an empty string when a value is missing.\n\n"
-        f"Saved user location: {saved_location}\n"
+        f"Saved user location: {saved_city}\n"
         f"Saved user insurance: {saved_insurance}\n\n"
         "Return all fields: Date, Specialty, Provider, Practice, Reason, Insurance, Location."
     )
@@ -1330,11 +1336,21 @@ def draft_user_info_storage_details(
     """Draft a confirmation message for user-info storage.
 
     Reads user_message_content, asks the LLM to extract only the supported
-    fields (location, insurance, username) the user actually mentioned, and
-    formats a bullet-list confirmation. Stores the draft string under
-    state["user_info_draft"] and routes to user_confirmation.
+    fields (username, insurance) the user actually mentioned, and formats a
+    bullet-list confirmation. Echoes the user's saved location as a city (read
+    only, not a newly-stored field) when one is on file. Stores the draft string
+    under state["user_info_draft"] and routes to user_confirmation.
     """
+    chat_id = state["chat_id"]
     user_message_content = state["user_message_content"]
+
+    client = create_client(
+        os.getenv("NEXT_PUBLIC_SUPABASE_URL"),
+        os.getenv("NEXT_PRIVATE_SUPABASE_API_KEY"),
+    )
+    row = client.table("users").select("location").eq("chat_id", chat_id).execute()
+    saved_location = (row.data[0] if row.data else {}).get("location") or {}
+    saved_city = resolve_location_city(chat_id, saved_location) or None
 
     extract_system = (
         "Extract profile fields the user explicitly asked to store. "
@@ -1350,12 +1366,13 @@ def draft_user_info_storage_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
-    fallback = profile_confirmation_text(extracted)
+    fallback = profile_confirmation_text(extracted, saved_city=saved_city)
     draft, validation_errors = _write_validated_text(
         "store_user_info_draft",
         {
             "user_message_content": user_message_content,
             "extracted_fields": extracted,
+            "saved_city": saved_city,
         },
         fallback,
     )

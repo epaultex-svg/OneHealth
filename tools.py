@@ -12,8 +12,49 @@ from firecrawl import Firecrawl
 from stagehand import AsyncStagehand
 from supabase import create_client
 
+from geocoding import reverse_geocode_city
+
 
 load_dotenv()
+
+
+def resolve_location_city(chat_id: str, location: dict | None) -> str | None:
+    """Return the city for a saved location dict, geocoding+backfilling if needed.
+
+    Read path for displaying a stored location as a place name:
+      - location already has a cached `city` -> return it (no network call)
+      - location has coordinates only -> reverse-geocode once; on success,
+        backfill `city` onto the row so later reads are free
+      - empty/None location, or geocode failure -> None (caller omits the field)
+    """
+    if not location:
+        return None
+
+    cached = location.get("city")
+    if cached:
+        return cached
+
+    lat = location.get("lat", location.get("latitude"))
+    lng = location.get("lng", location.get("longitude"))
+    if lat is None or lng is None:
+        return None
+
+    city = reverse_geocode_city(lat, lng)
+    if not city:
+        return None
+
+    try:
+        client = create_client(
+            os.getenv("NEXT_PUBLIC_SUPABASE_URL"),
+            os.getenv("NEXT_PRIVATE_SUPABASE_API_KEY"),
+        )
+        client.table("users").update({"location": {**location, "city": city}}).eq(
+            "chat_id", chat_id
+        ).execute()
+    except Exception:
+        pass
+
+    return city
 
 def _telegram_send(chat_id: str, text: str) -> None:
     """Push a status line to the user via Telegram. Best-effort, swallows errors."""
@@ -207,11 +248,17 @@ def store_info(
         row["username"] = username
         fields_written.append("username")
     if location is not None:
-        row["location"] = {
-            "lat": location["latitude"],
-            "lng": location["longitude"],
+        lat = location["latitude"]
+        lng = location["longitude"]
+        stored_location = {
+            "lat": lat,
+            "lng": lng,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+        city = reverse_geocode_city(lat, lng)
+        if city:
+            stored_location["city"] = city
+        row["location"] = stored_location
         fields_written.append("location")
     if website and context_id:
         row["browserbase_context_ids"] = (row.get("browserbase_context_ids") or []) + [

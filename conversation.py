@@ -228,7 +228,8 @@ def appointment_confirmation_text(details: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def profile_confirmation_text(extracted: dict[str, Any]) -> str:
+def profile_confirmation_text(extracted: dict[str, Any], saved_city: str | None = None) -> str:
+    header_len = 3
     lines = [profile_privacy_text(), "", "Confirm info to store:"]
     if username := extracted.get("username"):
         lines.append(f"- username: {username}")
@@ -238,8 +239,10 @@ def profile_confirmation_text(extracted: dict[str, Any]) -> str:
             if insurance.get(key):
                 parts.append(f"{key}: {insurance[key]}")
         lines.append(f"- insurance: {', '.join(parts) if parts else insurance}")
-    if len(lines) == 3:
+    if len(lines) == header_len:
         lines.append("- no supported profile fields found")
+    if saved_city:
+        lines.append(f"- location (on file): {saved_city}")
     lines.append("Does this look right?")
     return "\n".join(lines)
 

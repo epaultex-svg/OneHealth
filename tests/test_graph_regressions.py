@@ -2,9 +2,11 @@ import pytest
 
 import conversation
 import conversation_engine
+import geocoding
 import message_validation
 import nodes
 import profile_retrieval
+import tools
 from evals.onehealth_evaluators import user_experience_assertions_evaluator
 
 
@@ -603,21 +605,36 @@ def test_writer_retries_once_then_uses_fallback():
     assert "not specified" not in draft["text"]
 
 
-def test_draft_appointment_details_uses_sparse_fallback_with_saved_defaults(monkeypatch):
+def test_draft_appointment_details_shows_city_not_coordinates(monkeypatch):
+    captured = {}
+
+    class CapturingModel(FakeModel):
+        def with_structured_output(self, schema):
+            structured = self.structured
+
+            class Cap(FakeStructured):
+                def invoke(self, messages):
+                    captured["system"] = messages[0].content
+                    return structured
+
+            return Cap(structured)
+
     monkeypatch.setattr(
         nodes,
         "create_client",
         lambda *args, **kwargs: FakeSupabaseClient([
             {
-                "location": "30.196697, -95.501134",
+                "location": {"lat": 30.196697, "lng": -95.501134},
                 "insurance": "Aetna",
             }
         ]),
     )
+    # Geocoding is mocked: coordinates resolve to a city, no network call.
+    monkeypatch.setattr(nodes, "resolve_location_city", lambda chat_id, location: "Houston")
     monkeypatch.setattr(
         nodes,
         "_model",
-        lambda temperature=0.0: FakeModel(
+        lambda temperature=0.0: CapturingModel(
             structured={
                 "Date": "5/27",
                 "Specialty": "Dentist",
@@ -625,7 +642,7 @@ def test_draft_appointment_details_uses_sparse_fallback_with_saved_defaults(monk
                 "Practice": "not specified",
                 "Reason": "",
                 "Insurance": "Aetna",
-                "Location": "30.196697, -95.501134",
+                "Location": "Houston",
             },
             content="ok",
         ),
@@ -642,10 +659,50 @@ def test_draft_appointment_details_uses_sparse_fallback_with_saved_defaults(monk
     assert "- Date: 5/27" in draft
     assert "- Specialty: Dentist" in draft
     assert "- Insurance: Aetna" in draft
-    assert "- Location: 30.196697, -95.501134" in draft
+    assert "- Location: Houston" in draft
+    # The lat/lng must never reach the draft or the extraction prompt.
+    assert "30.196697" not in draft and "-95.501134" not in draft
+    assert "Houston" in captured["system"]
+    assert "30.196697" not in captured["system"] and "lat" not in captured["system"]
     assert "Practice" not in draft
     assert "Reason" not in draft
     assert "not specified" not in draft
+
+
+def test_draft_appointment_details_omits_location_when_city_unresolved(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "create_client",
+        lambda *args, **kwargs: FakeSupabaseClient([
+            {"location": {"lat": 30.19, "lng": -95.50}, "insurance": "Aetna"}
+        ]),
+    )
+    monkeypatch.setattr(nodes, "resolve_location_city", lambda chat_id, location: None)
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda temperature=0.0: FakeModel(
+            structured={
+                "Date": "5/27",
+                "Specialty": "Dentist",
+                "Provider": "",
+                "Practice": "",
+                "Reason": "",
+                "Insurance": "Aetna",
+                "Location": "",
+            },
+            content="ok",
+        ),
+    )
+
+    command = nodes.draft_appointment_details(
+        {"chat_id": "888", "user_message_content": "Dentist, 5/27"}
+    )
+
+    draft = command.update["appt_draft"]
+    assert "- Specialty: Dentist" in draft
+    assert "Location" not in draft
+    assert "30.19" not in draft and "-95.50" not in draft
 
 
 def test_correct_info_appointment_prompt_uses_relaxed_provider_schema(monkeypatch):
@@ -1364,3 +1421,249 @@ def test_book_appointment_marks_normalized_booking_success(monkeypatch):
     assert sent[-1]["text"].startswith("Booked your appointment")
     assert "Tuesday, May 26 at 9:00 AM" in sent[-1]["text"]
     assert "2026-05-26T09:00:00-04:00" not in sent[-1]["text"]
+
+
+# ---------------------------------------------------------------------------
+# Reverse geocoding: lat/lng -> city
+# ---------------------------------------------------------------------------
+
+
+class FakeGeoResponse:
+    def __init__(self, payload, ok=True, json_raises=False):
+        self._payload = payload
+        self._ok = ok
+        self._json_raises = json_raises
+
+    def raise_for_status(self):
+        if not self._ok:
+            raise RuntimeError("HTTP 500")
+
+    def json(self):
+        if self._json_raises:
+            raise ValueError("bad json")
+        return self._payload
+
+
+class CapturingBackfillTable:
+    def __init__(self, store):
+        self._store = store
+
+    def update(self, payload):
+        self._store["update"] = payload
+        return self
+
+    def eq(self, field, value):
+        self._store["eq"] = (field, value)
+        return self
+
+    def execute(self):
+        return type("Result", (), {"data": []})()
+
+
+class CapturingBackfillClient:
+    def __init__(self, store):
+        self._store = store
+
+    def table(self, name):
+        return CapturingBackfillTable(self._store)
+
+
+def test_reverse_geocode_city_returns_city(monkeypatch):
+    monkeypatch.setattr(
+        geocoding.httpx,
+        "get",
+        lambda *a, **k: FakeGeoResponse({"address": {"city": "Houston", "state": "Texas"}}),
+    )
+    assert geocoding.reverse_geocode_city(29.76, -95.36) == "Houston"
+
+
+def test_reverse_geocode_city_falls_back_to_town_then_county(monkeypatch):
+    monkeypatch.setattr(
+        geocoding.httpx,
+        "get",
+        lambda *a, **k: FakeGeoResponse({"address": {"village": "Smallville", "county": "Kent"}}),
+    )
+    assert geocoding.reverse_geocode_city(1.0, 2.0) == "Smallville"
+
+
+def test_reverse_geocode_city_none_when_no_place(monkeypatch):
+    monkeypatch.setattr(
+        geocoding.httpx, "get", lambda *a, **k: FakeGeoResponse({"address": {}})
+    )
+    assert geocoding.reverse_geocode_city(0.0, 0.0) is None
+
+
+def test_reverse_geocode_city_none_on_http_error(monkeypatch):
+    monkeypatch.setattr(
+        geocoding.httpx, "get", lambda *a, **k: FakeGeoResponse({}, ok=False)
+    )
+    assert geocoding.reverse_geocode_city(1.0, 2.0) is None
+
+
+def test_reverse_geocode_city_none_on_timeout(monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("timeout")
+
+    monkeypatch.setattr(geocoding.httpx, "get", _boom)
+    assert geocoding.reverse_geocode_city(1.0, 2.0) is None
+
+
+def test_reverse_geocode_city_none_on_malformed_json(monkeypatch):
+    monkeypatch.setattr(
+        geocoding.httpx, "get", lambda *a, **k: FakeGeoResponse(None, json_raises=True)
+    )
+    assert geocoding.reverse_geocode_city(1.0, 2.0) is None
+
+
+def test_resolve_location_city_uses_cached_city(monkeypatch):
+    monkeypatch.setattr(
+        tools,
+        "reverse_geocode_city",
+        lambda *a, **k: pytest.fail("should not geocode when city cached"),
+    )
+    assert tools.resolve_location_city("888", {"lat": 1, "lng": 2, "city": "Reno"}) == "Reno"
+
+
+def test_resolve_location_city_geocodes_and_backfills(monkeypatch):
+    store = {}
+    monkeypatch.setattr(tools, "reverse_geocode_city", lambda lat, lng: "Austin")
+    monkeypatch.setattr(tools, "create_client", lambda *a, **k: CapturingBackfillClient(store))
+    city = tools.resolve_location_city("888", {"lat": 30.2, "lng": -97.7})
+    assert city == "Austin"
+    assert store["update"]["location"]["city"] == "Austin"
+    assert store["eq"] == ("chat_id", "888")
+
+
+def test_resolve_location_city_none_skips_backfill(monkeypatch):
+    monkeypatch.setattr(tools, "reverse_geocode_city", lambda lat, lng: None)
+    monkeypatch.setattr(
+        tools, "create_client", lambda *a, **k: pytest.fail("should not backfill on geocode failure")
+    )
+    assert tools.resolve_location_city("888", {"lat": 1, "lng": 2}) is None
+
+
+def test_resolve_location_city_none_for_empty_location():
+    assert tools.resolve_location_city("888", None) is None
+    assert tools.resolve_location_city("888", {}) is None
+    assert tools.resolve_location_city("888", {"updated_at": "x"}) is None
+
+
+def test_store_info_persists_city(monkeypatch):
+    captured = {}
+
+    class StoreTable:
+        def select(self, fields):
+            return self
+
+        def eq(self, field, value):
+            return self
+
+        def execute(self):
+            return type("Result", (), {"data": []})()
+
+        def upsert(self, row, on_conflict=None):
+            captured["row"] = row
+            return self
+
+    class StoreClient:
+        def table(self, name):
+            return StoreTable()
+
+    monkeypatch.setattr(tools, "create_client", lambda *a, **k: StoreClient())
+    monkeypatch.setattr(tools, "reverse_geocode_city", lambda lat, lng: "Houston")
+    tools.store_info.invoke({"chat_id": "888", "location": {"latitude": 29.76, "longitude": -95.36}})
+    assert captured["row"]["location"]["city"] == "Houston"
+    assert captured["row"]["location"]["lat"] == 29.76
+
+
+def test_store_info_stores_coords_without_city_on_geocode_failure(monkeypatch):
+    captured = {}
+
+    class StoreTable:
+        def select(self, fields):
+            return self
+
+        def eq(self, field, value):
+            return self
+
+        def execute(self):
+            return type("Result", (), {"data": []})()
+
+        def upsert(self, row, on_conflict=None):
+            captured["row"] = row
+            return self
+
+    class StoreClient:
+        def table(self, name):
+            return StoreTable()
+
+    monkeypatch.setattr(tools, "create_client", lambda *a, **k: StoreClient())
+    monkeypatch.setattr(tools, "reverse_geocode_city", lambda lat, lng: None)
+    tools.store_info.invoke({"chat_id": "888", "location": {"latitude": 1.0, "longitude": 2.0}})
+    assert "city" not in captured["row"]["location"]
+    assert captured["row"]["location"]["lat"] == 1.0
+
+
+def test_summarize_location_emits_city_not_coordinates(monkeypatch):
+    monkeypatch.setattr(profile_retrieval, "resolve_location_city", lambda chat_id, location: "Dallas")
+    summary = profile_retrieval._summarize_location({"lat": 32.7, "lng": -96.8}, "888")
+    assert summary["city"] == "Dallas"
+    assert "coordinates" not in summary
+
+
+def test_summarize_location_no_coords_leak_when_unresolved(monkeypatch):
+    monkeypatch.setattr(profile_retrieval, "resolve_location_city", lambda chat_id, location: None)
+    summary = profile_retrieval._summarize_location({"lat": 1, "lng": 2}, "888")
+    assert "coordinates" not in summary
+    assert "city" not in summary
+
+
+def test_get_retrievable_profile_location_shows_city(monkeypatch):
+    monkeypatch.setattr(
+        profile_retrieval, "read_profile_row", lambda chat_id: {"location": {"lat": 1, "lng": 2}}
+    )
+    monkeypatch.setattr(profile_retrieval, "resolve_location_city", lambda chat_id, location: "Reno")
+    profile = profile_retrieval.get_retrievable_profile("888", requested_fields=["location"])
+    assert profile["fields"]["location"] == {"city": "Reno"}
+
+
+def test_draft_user_info_storage_echoes_saved_city(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "create_client",
+        lambda *a, **k: FakeSupabaseClient([{"location": {"lat": 1, "lng": 2}}]),
+    )
+    monkeypatch.setattr(nodes, "resolve_location_city", lambda chat_id, location: "Houston")
+    # Empty model content fails validation -> deterministic fallback is used.
+    monkeypatch.setattr(
+        nodes, "_model", lambda temperature=0.0: FakeModel(structured={"username": "Bob"}, content="")
+    )
+    command = nodes.draft_user_info_storage_details(
+        {"chat_id": "888", "user_message_content": "call me Bob"}
+    )
+    draft = command.update["user_info_draft"]
+    assert "- username: Bob" in draft
+    assert "- location (on file): Houston" in draft
+
+
+def test_draft_user_info_storage_no_location_line_when_absent(monkeypatch):
+    monkeypatch.setattr(nodes, "create_client", lambda *a, **k: FakeSupabaseClient([{}]))
+    monkeypatch.setattr(nodes, "resolve_location_city", lambda chat_id, location: None)
+    monkeypatch.setattr(
+        nodes, "_model", lambda temperature=0.0: FakeModel(structured={"username": "Bob"}, content="")
+    )
+    command = nodes.draft_user_info_storage_details(
+        {"chat_id": "888", "user_message_content": "call me Bob"}
+    )
+    draft = command.update["user_info_draft"]
+    assert "- username: Bob" in draft
+    assert "location (on file)" not in draft
+
+
+def test_validator_accepts_city_context_line():
+    validation = message_validation.validate_generated_message(
+        {"text": conversation.profile_confirmation_text({"username": "Bob"}, saved_city="Houston")},
+        "store_user_info_draft",
+        {"extracted_fields": {"username": "Bob"}, "saved_city": "Houston"},
+    )
+    assert validation["valid"] is True
