@@ -1099,6 +1099,172 @@ def send_direct_response(state: OneHealthAgentState) -> Command[Literal["__end__
     send_message.invoke({"chat_id": state["chat_id"], "text": response, "remove_keyboard": True})
     return Command(update={"direct_response": response, "message_validation_errors": errors}, goto=END)
 
+
+def _appointment_start(record: dict[str, Any]) -> str:
+    return _clean(record.get("start_time") or record.get("start") or record.get("time"))
+
+
+def _upcoming_appointments(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    now = datetime.now(timezone.utc)
+    dated: list[tuple[datetime, dict[str, Any]]] = []
+    for record in _extract_items(payload, "appointments"):
+        if record.get("cancelled") or record.get("deleted"):
+            continue
+        start = _parse_datetime(_appointment_start(record))
+        if start is None or start < now:
+            continue
+        dated.append((start, record))
+    dated.sort(key=lambda pair: pair[0])
+    return [record for _, record in dated]
+
+
+def _appointment_local_when(record: dict[str, Any]) -> str:
+    """Readable start time in the clinic's local timezone."""
+    start = _parse_datetime(_appointment_start(record))
+    if start is None:
+        return _appointment_start(record)
+
+    offset = _clean(record.get("timezone_offset"))
+    match = re.match(r"^([+-])(\d{2}):?(\d{2})$", offset)
+    if match:
+        sign = 1 if match.group(1) == "+" else -1
+        delta = timedelta(hours=int(match.group(2)), minutes=int(match.group(3)))
+        start = start.astimezone(timezone(sign * delta))
+
+    hour = start.hour % 12 or 12
+    return f"{start.strftime('%A, %B')} {start.day} at {hour}:{start:%M} {start:%p}"
+
+
+def _format_appointment_line(record: dict[str, Any], index: int) -> str:
+    bits = [_appointment_local_when(record)]
+    provider = record.get("provider") if isinstance(record.get("provider"), dict) else record
+    provider_name = _provider_label(provider)
+    if provider_name and not provider_name.startswith("ID "):
+        bits.append(f"with {provider_name}")
+    appt_type = record.get("appointment_type")
+    if isinstance(appt_type, dict):
+        type_name = _appointment_type_label(appt_type)
+        if type_name and not type_name.startswith("ID "):
+            bits.append(f"({type_name})")
+    return f"{index}. " + " ".join(bits)
+
+
+def view_appointments(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
+    """List the user's upcoming NexHealth appointments."""
+    chat_id = state["chat_id"]
+    client = create_client(
+        os.getenv("NEXT_PUBLIC_SUPABASE_URL"),
+        os.getenv("NEXT_PRIVATE_SUPABASE_API_KEY"),
+    )
+    row = (
+        client.table("users")
+        .select("patient_info, nexhealth_patient_id")
+        .eq("chat_id", chat_id)
+        .execute()
+    )
+    user_row = row.data[0] if row.data else {}
+    stored_patient_info = user_row.get("patient_info")
+    if not isinstance(stored_patient_info, dict):
+        stored_patient_info = {}
+
+    patient_id = (
+        _coerce_int(state.get("nexhealth_patient_id"))
+        or _coerce_int(user_row.get("nexhealth_patient_id"))
+    )
+    token_update: dict[str, Any] = {}
+
+    if patient_id is None:
+        patient_info = _merge_patient_info(state.get("patient_info"), stored_patient_info)
+        patient_info = _collect_patient_info({**state, "patient_info": patient_info})
+        if patient_info is None:
+            return Command(update={"conversation_status": "cancelled"}, goto=END)
+
+        location_id = (
+            _coerce_int(state.get("nexhealth_location_id"))
+            or _coerce_int(os.getenv("NEXHEALTH_LOCATION_ID"))
+        )
+        if location_id is not None:
+            payload, token_update = _nexhealth_request(
+                state,
+                "GET",
+                "/patients",
+                params=_patient_search_params(location_id, patient_info),
+            )
+            patients = [
+                _normalize_patient_record(patient)
+                for patient in _extract_items(payload, "patients")
+            ]
+            matched = next((p for p in patients if _patient_matches(p, patient_info)), None)
+            if matched is not None:
+                patient_id = _record_id(matched)
+
+        if patient_id is None:
+            fallback = "I do not have an appointment record on file for you yet. Want me to book one?"
+            response, errors = _write_validated_text(
+                "view_appointments",
+                {"user_message_content": state.get("user_message_content", ""), "appointments": []},
+                fallback,
+            )
+            send_message.invoke({"chat_id": chat_id, "text": response, "remove_keyboard": True})
+            return Command(
+                update={"direct_response": response, "message_validation_errors": errors, **token_update},
+                goto=END,
+            )
+
+        store_info.invoke({
+            "chat_id": chat_id,
+            "patient_info": patient_info,
+            "nexhealth_patient_id": patient_id,
+        })
+
+    location_id = (
+        _coerce_int(state.get("nexhealth_location_id"))
+        or _coerce_int(os.getenv("NEXHEALTH_LOCATION_ID"))
+    )
+    if location_id is None:
+        raise RuntimeError("Cannot list appointments without a NexHealth location_id (set NEXHEALTH_LOCATION_ID)")
+
+    today = datetime.now(timezone.utc).date()
+    params: dict[str, Any] = {
+        "patient_id": patient_id,
+        "location_id": location_id,
+        "start": today.isoformat(),
+        "end": (today + timedelta(days=365)).isoformat(),
+        "per_page": 50,
+    }
+    payload, appts_token_update = _nexhealth_request(
+        {**state, **token_update},
+        "GET",
+        "/appointments",
+        params=params,
+    )
+    token_update.update(appts_token_update)
+
+    appts = _upcoming_appointments(payload)
+    if appts:
+        lines = [_format_appointment_line(record, index) for index, record in enumerate(appts, start=1)]
+        fallback = "Your upcoming appointments:\n" + "\n".join(lines)
+    else:
+        lines = []
+        fallback = "You have no upcoming appointments. Want me to book one?"
+
+    response, errors = _write_validated_text(
+        "view_appointments",
+        {"user_message_content": state.get("user_message_content", ""), "appointments": lines},
+        fallback,
+    )
+    send_message.invoke({"chat_id": chat_id, "text": response, "remove_keyboard": True})
+    return Command(
+        update={
+            "viewed_appointments": appts,
+            "direct_response": response,
+            "message_validation_errors": errors,
+            **token_update,
+        },
+        goto=END,
+    )
+
+
 def draft_appointment_details(
     state: OneHealthAgentState,
 ) -> Command[Literal["send_user_confirmation"]]:

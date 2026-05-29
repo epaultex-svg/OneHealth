@@ -15,6 +15,7 @@ TOP_LEVEL_ACTIONS: list[ConversationRoute] = [
     "request_user_location",
     "store_user_location",
     "draft_appointment",
+    "view_appointments",
     "clarify",
 ]
 
@@ -25,6 +26,7 @@ NODE_FOR_ROUTE: dict[str, str] = {
     "request_user_location": "request_user_location",
     "store_user_location": "store_user_location",
     "draft_appointment": "draft_appointment_details",
+    "view_appointments": "view_appointments",
     "handle_confirmation": "interpret_user_confirmation",
     "handle_correction": "correct_info",
     "handle_choice": "send_direct_response",
@@ -260,10 +262,14 @@ def coerce_turn(turn: dict[str, Any], allowed_actions: list[ConversationRoute]) 
         intent = "store_user_info"
 
     action = turn.get("action") or route_name_from_intent(intent, bool(turn.get("location")))
-    if intent in {"appointment_view", "appointment_reschedule", "appointment_cancel"}:
+    if intent == "appointment_view":
+        action = "view_appointments"
+    elif intent in {"appointment_reschedule", "appointment_cancel"}:
         action = "direct_response"
     if action not in allowed_actions:
-        if intent in {"appointment_view", "appointment_reschedule", "appointment_cancel"}:
+        if intent == "appointment_view":
+            action = "view_appointments"
+        elif intent in {"appointment_reschedule", "appointment_cancel"}:
             action = "direct_response"
         else:
             action = "clarify"
@@ -299,7 +305,9 @@ def route_name_from_intent(intent: str, has_location: bool = False) -> Conversat
         return "store_user_location" if has_location else "request_user_location"
     if intent == "appointment_book":
         return "draft_appointment"
-    if intent in {"appointment_view", "appointment_reschedule", "appointment_cancel"}:
+    if intent == "appointment_view":
+        return "view_appointments"
+    if intent in {"appointment_reschedule", "appointment_cancel"}:
         return "direct_response"
     if intent == "confirmation_reply":
         return "handle_confirmation"

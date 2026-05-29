@@ -39,6 +39,7 @@ from nodes import (
     ensure_user,
     store_user_location,
     store_in_supabase,
+    view_appointments,
 )
 from state import OneHealthAgentState
 from langgraph.types import RetryPolicy
@@ -59,6 +60,7 @@ def build_graph(checkpointer=None):
     workflow.add_node("store_user_location", store_user_location)
     workflow.add_node("send_direct_response", send_direct_response, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("retrieve_info", retrieve_info)
+    workflow.add_node("view_appointments", view_appointments, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("send_clarify", send_clarify, retry_policy=RetryPolicy(max_attempts=3))
     workflow.add_node("draft_appointment_details", draft_appointment_details)
     workflow.add_node("draft_user_info_storage_details", draft_user_info_storage_details)
