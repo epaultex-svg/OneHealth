@@ -1,122 +1,148 @@
 # OneHealth
 
-OneHealth is a LangGraph healthcare scheduling agent that runs through Telegram. It classifies user messages, confirms extracted details, books appointments through NexHealth, and stores user preferences in Supabase.
+OneHealth is a LangGraph-based healthcare scheduling agent that runs over Telegram. It can collect appointment details, confirm them with the user, resolve NexHealth scheduling records, show available slots, book appointments, and remember confirmed profile data in Supabase.
 
-## Current Architecture
+The project is built as a real multi-turn agent, not a single prompt wrapper. It uses deterministic routing for simple protocol cases, LLM planning for ambiguous messages, guarded response generation, Telegram interrupt/resume, NexHealth API calls, Postgres-backed webhook work tracking, and LangSmith evaluations.
+
+## Features
+
+- Telegram message intake through polling or webhook delivery.
+- Multi-turn LangGraph conversations with `interrupt()` and `Command(resume=...)`.
+- Intent routing for booking, appointment viewing, profile storage, profile retrieval, location updates, help, greetings, and unsupported appointment actions.
+- User confirmation before profile writes or appointment booking.
+- NexHealth scheduling pipeline for institutions, locations, providers, patients, appointment types, available slots, and appointment creation.
+- Supabase persistence for users, locations, insurance, patient details, and cached NexHealth patient IDs.
+- Postgres persistence for Telegram update processing and normalized appointment booking records.
+- Idempotent appointment booking through deterministic booking keys.
+- Privacy-aware profile retrieval that hides sensitive values unless explicitly requested.
+- LLM output validation for medical-advice risk, false side-effect claims, PHI exposure, empty messages, and missing appointment details.
+- LangSmith trajectory, state, and user-experience evaluators.
+
+## Architecture
 
 ```text
-Telegram message
-  -> receive_message
-  -> ensure_user
-  -> classify_intent
-  -> direct response OR confirmation/correction loop
-  -> appointment booking OR preference storage OR location update
+Telegram
+  -> FastAPI webhook or getUpdates polling
+  -> normalize message
+  -> LangGraph thread telegram:{chat_id}
+  -> plan next turn
+  -> direct response OR confirmation loop OR scheduling flow
+  -> Telegram reply
 ```
 
-First contact creates a minimal Supabase user row only. Location and patient
-details are collected just-in-time inside workflows that need them.
-
-Appointment booking path:
+Main booking path:
 
 ```text
 draft_appointment_details
   -> send_user_confirmation
   -> interpret_user_confirmation
   -> start_nexhealth_scheduling
-  -> get_institution [-> send_institution_options -> select_institution]
-  -> get_location [-> send_location_options -> select_location]
-  -> get_provider [-> send_provider_options -> select_provider]
+  -> get_institution
+  -> get_location
+  -> get_provider
   -> get_patient
-  -> get_appointment_type [-> send_appointment_type_options -> select_appointment_type]
-  -> get_appointment_slots -> send_slot_options -> select_appointment_slot
+  -> get_appointment_type
+  -> get_appointment_slots
+  -> send_slot_options
+  -> select_appointment_slot
   -> book_appointment
 ```
 
-Bracketed branches only appear when auto-selection cannot resolve a single record. Institution and location auto-select when only one option exists or an env override is set (`NEXHEALTH_LOCATION_ID`).
+The graph skips selection prompts when it can safely auto-select one option, such as a single NexHealth result or `NEXHEALTH_LOCATION_ID`. When multiple options exist, it sends Telegram reply buttons and still accepts numeric replies.
 
-Preference storage path:
+## Tech Stack
 
-```text
-draft_user_info_storage_details
-  -> send_user_confirmation
-  -> interpret_user_confirmation
-  -> store_in_supabase
-```
+| Area | Technology |
+|------|------------|
+| Agent orchestration | LangGraph |
+| LLM provider | OpenRouter via `langchain-openrouter` |
+| Messaging | Telegram Bot API |
+| API server | FastAPI, Uvicorn |
+| Scheduling | NexHealth API |
+| User data | Supabase |
+| Durable worker state | Postgres, LangGraph Postgres checkpointer |
+| Evaluation | LangSmith |
+| Package management | uv |
+| Tests | pytest |
 
-## Documentation
+## Project Structure
 
-| Document | Purpose |
-|----------|---------|
-| [README.md](README.md) | Setup, run commands, env vars, architecture overview |
-| [AGENTS.md](AGENTS.md) | Full node reference, state schema, tools, design decisions |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | Why the system works this way — planner/writer/validator, interrupt pattern, NexHealth pipeline |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Dev setup, adding new intents/nodes, validation rules, code style |
-| [evals/README.md](evals/README.md) | Running and uploading LangSmith evaluators |
-
-## Core Files
-
-| File | Purpose |
+| Path | Purpose |
 |------|---------|
-| `agent.py` | Builds and compiles the LangGraph workflow |
-| `nodes.py` | Node implementations, LLM prompts, NexHealth helpers, Telegram-facing flow |
-| `state.py` | Shared graph state schema and structured output types |
-| `conversation.py` | Centralized user-facing copy, reply button helpers, and conversation state table |
-| `tools.py` | Telegram, Supabase, and legacy Firecrawl tool wrappers |
-| `langgraph.json` | LangGraph Studio graph config |
-| `evals/` | LangSmith trajectory runner and deterministic evaluators |
-| `OneHealth_test_dataset.csv` | Evaluation scenarios for major workflows |
+| [agent.py](agent.py) | Builds and compiles the LangGraph workflow |
+| [nodes.py](nodes.py) | Graph nodes, NexHealth helpers, profile flow, booking flow |
+| [state.py](state.py) | Shared graph state and typed payloads |
+| [conversation_engine.py](conversation_engine.py) | LLM planner and route-specific writer |
+| [conversation_policy.py](conversation_policy.py) | Deterministic overrides and route-to-node mapping |
+| [conversation.py](conversation.py) | User-facing copy, keyboards, cancel/retry behavior |
+| [message_validation.py](message_validation.py) | Safety checks for generated responses |
+| [tools.py](tools.py) | Telegram, Supabase, and legacy Firecrawl tools |
+| [appointments.py](appointments.py) | Normalized appointment booking persistence |
+| [server.py](server.py) | FastAPI webhook app |
+| [webhook_store.py](webhook_store.py) | Postgres-backed Telegram update ledger |
+| [webhook_worker.py](webhook_worker.py) | Single-process worker that invokes or resumes graph threads |
+| [evals/](evals/) | LangSmith runner and deterministic evaluators |
+| [tests/](tests/) | Pytest suite |
 
-## Environment
+## Setup
 
-Create `.env` with the values used by the graph:
+### Requirements
 
-```bash
-TELEGRAM_API_TOKEN=
-TELEGRAM_WEBHOOK_SECRET=
-PUBLIC_BASE_URL=
-DATABASE_URL=
-OPENROUTER_API_KEY=
-NEXT_PUBLIC_SUPABASE_URL=
-NEXT_PRIVATE_SUPABASE_API_KEY=
-NEXHEALTH_API_KEY=
-NEXHEALTH_SUBDOMAIN=
-NEXHEALTH_LOCATION_ID=
-NEXHEALTH_API_BASE=https://nexhealth.info
-NEXHEALTH_API_VERSION=v20240412
-```
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/)
+- Telegram bot token
+- Supabase project
+- Postgres database URL
+- NexHealth API credentials
+- OpenRouter API key
+- LangSmith API key, only for hosted evals
 
-`NEXHEALTH_LOCATION_ID` is optional. When set, the graph skips `/locations` lookup and schedules against that location.
-
-## Run Locally
-
-Install dependencies:
+### Install
 
 ```bash
 uv sync
 ```
 
-Compile-check Python files:
+### Configure Environment
+
+Create `.env` in the project root:
 
 ```bash
-uv run python -m compileall agent.py nodes.py tools.py state.py db.py appointments.py telegram_webhook.py webhook_store.py webhook_worker.py server.py tests
+TELEGRAM_API_TOKEN=
+TELEGRAM_WEBHOOK_SECRET=
+PUBLIC_BASE_URL=
+
+DATABASE_URL=
+NEXT_PUBLIC_SUPABASE_URL=
+NEXT_PRIVATE_SUPABASE_API_KEY=
+
+OPENROUTER_API_KEY=
+
+NEXHEALTH_API_KEY=
+NEXHEALTH_SUBDOMAIN=
+NEXHEALTH_LOCATION_ID=
+NEXHEALTH_API_BASE=https://nexhealth.info
+NEXHEALTH_API_VERSION=v20240412
+
+LANGSMITH_API_KEY=
+ONEHEALTH_LANGSMITH_DATASET="OneHealth Trajectory Dataset"
 ```
 
-Run the graph directly:
+`NEXHEALTH_LOCATION_ID` is optional for booking. When set, OneHealth skips the NexHealth location picker. Appointment viewing currently requires it.
+
+## Run Locally
+
+Compile-check source files:
 
 ```bash
-uv run python agent.py
+uv run python -m compileall agent.py nodes.py tools.py state.py db.py appointments.py \
+  telegram_webhook.py webhook_store.py webhook_worker.py server.py tests
 ```
 
-Run with LangGraph Studio/API:
+Run LangGraph dev server:
 
 ```bash
 uv run langgraph dev
-```
-
-Graph name in `langgraph.json`:
-
-```text
-onehealth -> ./agent.py:graph
 ```
 
 Run the production webhook server:
@@ -125,63 +151,7 @@ Run the production webhook server:
 uv run uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
-## Evaluation
-
-Run a local smoke check from a JSON dataset:
-
-```bash
-uv run python -m evals.run_onehealth_langsmith_eval \
-  --local-json dataset.json \
-  --limit 1 \
-  --allow-side-effects
-```
-
-Run against LangSmith dataset:
-
-```bash
-uv run python -m evals.run_onehealth_langsmith_eval \
-  --dataset "OneHealth Trajectory Dataset" \
-  --experiment-prefix "onehealth-trajectory" \
-  --allow-side-effects
-```
-
-Important: evaluation uses real graph code. The runner captures outbound Telegram messages for scoring instead of sending them, but live runs can still write Supabase rows, create NexHealth patients, and book appointments. Use `--allow-side-effects` only when those effects are intended.
-
-## Conversation State Coverage
-
-`conversation.py` defines the user-facing state contract. Every major step has loading, empty, error, success, retry, and cancel behavior:
-
-| Step | Loading | Empty | Error | Success | Retry | Cancel |
-|------|---------|-------|-------|---------|-------|--------|
-| Location request | Ask Telegram for location permission | Continue without location | Continue if storage fails | Store location | `/add_location` later | Stop onboarding |
-| Patient info | Explain why demographics are needed | List missing fields | Ask for field-specific retry | Store complete demographics | Ask only for remaining fields | Stop before patient write |
-| Appointment confirmation | Draft extracted details | Show `not specified` | Ask what to change | Proceed to scheduling | Re-confirm corrected draft | Stop before booking |
-| Profile confirmation | Extract supported fields | Store nothing | Ask what to change | Store confirmed fields | Re-confirm corrected draft | Stop before Supabase write |
-| Provider selection | Fetch requestable providers | Suggest changing location/request | Reject invalid choice | Store provider ID | Send buttons again | Stop before patient lookup |
-| Appointment type selection | Fetch appointment types | Suggest changing reason/request | Reject invalid choice | Store type ID | Send buttons again | Stop before slot search |
-| Slot selection | Search available slots | Suggest another date/provider/type | Reject invalid choice | Store selected slot | Send buttons again | Stop before booking |
-| Booking | Reserve booking key | Guard against missing slot | Mark booking failure | Confirm readable time | Reuse existing booking status | Cancel unavailable after booking starts |
-
-## User Experience Notes
-
-- Every appointment and profile update goes through a confirmation prompt before write or booking.
-- Users can deny confirmation, describe corrections, and review updated details.
-- Patient demographics and profile storage include privacy/consent copy before asking or storing.
-- Institution and NexHealth location selection present Telegram reply buttons when multiple options exist; single-option and env-override cases skip the prompt entirely.
-- Provider, appointment type, and slot pickers send Telegram reply buttons and still accept numeric replies plus some record/ID matches.
-- Invalid provider/type/slot replies send a specific retry message and do not advance.
-- Users can reply `Cancel` during confirmation, correction, patient-info collection, provider/type/slot/institution selection, or slot selection. Cancellation stops before side effects for that step.
-- Empty NexHealth results end safely with recovery actions: try another date, choose a different provider or appointment type, change request, or cancel.
-- Viewing upcoming appointments is supported: the `appointment_view` intent routes to the `view_appointments` node, which fetches upcoming appointments from NexHealth and displays them. Requires `NEXHEALTH_LOCATION_ID` to be set.
-- Rescheduling and cancellation requests (`appointment_reschedule`, `appointment_cancel`) are recognized and answered gracefully — those workflows are not yet implemented.
-- All outbound messages render `**bold**` correctly in Telegram. The `send_message` helper HTML-escapes text and converts `**markers**` to `<b>` tags before sending with `parse_mode=HTML`.
-- Patient demographics, location, and insurance are sensitive. Production should also expose update/delete controls.
-
-## Telegram Webhook
-
-The production entrypoint is the FastAPI app in `server.py`.
-
-Register the webhook:
+Register Telegram webhook:
 
 ```bash
 curl -X POST "https://api.telegram.org/bot$TELEGRAM_API_TOKEN/setWebhook" \
@@ -193,54 +163,113 @@ curl -X POST "https://api.telegram.org/bot$TELEGRAM_API_TOKEN/setWebhook" \
   }'
 ```
 
-Data flow:
+Health check:
 
-```text
-Telegram
-  POST /telegram/webhook
-        |
-        v
-verify secret -> normalize update -> insert telegram_updates
-        |
-        v
-single in-process worker
-        |
-        v
-thread_id = telegram:{chat_id}
-        |
-        +-- pending interrupt -> graph.invoke(Command(resume=message))
-        +-- no interrupt      -> graph.invoke(initial seeded state)
-        |
-        v
-send_message() -> Telegram
+```bash
+curl "$PUBLIC_BASE_URL/health"
 ```
 
-Run one server replica for v1. Multiple replicas need database row claiming and
-per-chat distributed locks before they can safely process the same Telegram chat
-in parallel.
+Expected response:
 
-## Persistence
-
-`telegram_updates` is the durable webhook work ledger. Duplicate Telegram
-`update_id` values are ignored after the first insert.
-
-`appointments` is the normalized booking source of truth. It owns
-`booking_key` uniqueness and NexHealth booking status. `users.appointments` is
-legacy history and new booking writes no longer use it.
-
-The app creates these tables on startup with `CREATE TABLE IF NOT EXISTS`.
+```json
+{"status":"ok"}
+```
 
 ## Tests
 
+Run all tests:
+
 ```bash
-uv run pytest
+uv run python -m pytest
 ```
 
-The test suite covers webhook parsing/security/dedupe, worker run/resume
-routing, seeded-message graph regression, appointment booking idempotency,
-conversation state coverage, privacy copy, cancel flow, invalid-choice retry,
-no-slot recovery copy, Telegram buttons, and UX assertion scoring.
+Run graph regression tests:
 
-## Legacy Notes
+```bash
+uv run python -m pytest tests/test_graph_regressions.py -v
+```
 
-Older architecture references Firecrawl search, Browserbase Contexts, and Stagehand booking automation. Current active graph books through NexHealth API directly. `firecrawl_search()` remains in `tools.py`, but it is not wired into `agent.py`.
+Use `uv run python -m pytest` instead of `uv run pytest` so pytest runs inside the project virtual environment.
+
+Current tests cover:
+
+- Telegram update normalization and webhook secret checks
+- Duplicate Telegram update handling
+- Worker run/resume behavior
+- Deterministic intent routing
+- Confirmation, correction, cancellation, and invalid-choice retry flows
+- Telegram HTML formatting
+- Appointment booking idempotency
+- City-based location display instead of raw coordinates
+- LangSmith UX assertion scoring
+
+## Evaluations
+
+Run a local JSON smoke eval:
+
+```bash
+uv run python -m evals.run_onehealth_langsmith_eval \
+  --local-json dataset.json \
+  --limit 1 \
+  --allow-side-effects
+```
+
+Run against the LangSmith dataset:
+
+```bash
+uv run python -m evals.run_onehealth_langsmith_eval \
+  --dataset "OneHealth Trajectory Dataset" \
+  --experiment-prefix "onehealth-trajectory" \
+  --allow-side-effects
+```
+
+The eval runner captures outbound Telegram messages for scoring, but live graph code can still write Supabase rows, create NexHealth patients, and book appointments. Use sandbox credentials.
+
+Evaluators check node trajectory, expected final-state fields, privacy copy, no-slot recovery, invalid-choice retry messages, cancellation behavior, and Telegram reply buttons.
+
+## Data and Persistence
+
+OneHealth uses three persistence layers:
+
+| Store | Data |
+|-------|------|
+| Supabase `users` | Telegram user profile, insurance, location, patient details, cached NexHealth patient ID |
+| Postgres `telegram_updates` | Durable webhook queue and duplicate update protection |
+| Postgres `appointments` | Normalized appointment records keyed by booking idempotency key |
+
+`db.py` creates `telegram_updates` and `appointments` with `CREATE TABLE IF NOT EXISTS`.
+
+## Safety and Privacy
+
+- Patient demographics are collected only when scheduling needs them.
+- Appointment booking and profile storage both require explicit user confirmation.
+- Cancel replies stop before the side effect for confirmation, correction, patient info, provider, appointment type, location, institution, and slot steps.
+- Profile retrieval hides sensitive values such as member ID, date of birth, phone, and email unless the user asks for that exact field.
+- Generated replies pass through validation before Telegram send.
+- Telegram output is HTML-escaped and `**bold**` markers are converted to `<b>` tags in `send_message()`.
+
+## Engineering Highlights
+
+- LangGraph interrupt/resume turns stateless Telegram messages into durable multi-turn workflows.
+- Planner/writer/validator split reduces LLM failure blast radius.
+- Deterministic overrides avoid LLM calls for greetings, help, cancel, `/add_location`, generic booking requests, and location payloads.
+- NexHealth token is cached in graph state and refreshed when stale.
+- Appointment booking key prevents duplicate local booking attempts.
+- Webhook ledger ignores duplicate Telegram `update_id` values.
+- LangSmith evals score both graph behavior and user-facing copy.
+
+## Current Limits
+
+- Rescheduling and cancellation are recognized but not implemented.
+- Appointment viewing requires `NEXHEALTH_LOCATION_ID`.
+- Webhook worker is single-replica. Multi-replica deployment needs per-chat distributed locks and database row claiming.
+- Firecrawl and Stagehand dependencies remain for legacy helpers, but active scheduling uses NexHealth APIs directly.
+- Production use needs full HIPAA review, retention policy, and user-facing update/delete controls.
+
+## More Documentation
+
+- [AGENTS.md](AGENTS.md): full state, node, tool, and design reference for coding agents.
+- [ARCHITECTURE.md](ARCHITECTURE.md): deeper architecture explanation.
+- [CONTRIBUTING.md](CONTRIBUTING.md): developer setup and workflow extension guide.
+- [evals/README.md](evals/README.md): LangSmith evaluator usage.
+- [wiki/overview.md](wiki/overview.md): knowledge-base overview and concept links.
