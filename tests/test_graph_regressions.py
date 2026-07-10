@@ -705,6 +705,41 @@ def test_draft_appointment_details_omits_location_when_city_unresolved(monkeypat
     assert "30.19" not in draft and "-95.50" not in draft
 
 
+def test_draft_appointment_details_survives_none_structured_output(monkeypatch):
+    """Regression: structured-output extraction can return None (model emits no
+    valid tool call). draft_appointment_details must not crash with
+    TypeError("argument of type 'NoneType' is not a container or iterable")."""
+
+    class NoneModel(FakeModel):
+        def with_structured_output(self, schema):
+            return FakeStructured(None)
+
+    monkeypatch.setattr(
+        nodes,
+        "create_client",
+        lambda *args, **kwargs: FakeSupabaseClient([{"location": None, "insurance": None}]),
+    )
+    monkeypatch.setattr(nodes, "resolve_location_city", lambda chat_id, location: "")
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: None))
+    monkeypatch.setattr(
+        nodes,
+        "_model",
+        lambda temperature=0.0: NoneModel(content="What would you like to book?"),
+    )
+
+    command = nodes.draft_appointment_details(
+        {
+            "chat_id": "888",
+            "user_message_content": "book an appointment for me at green river dental",
+        }
+    )
+
+    assert command.goto == "send_user_confirmation"
+    # No details extracted -> empty detail set, draft still produced.
+    assert command.update["appt_details"] == {}
+    assert isinstance(command.update["appt_draft"], str) and command.update["appt_draft"]
+
+
 def test_correct_info_appointment_prompt_uses_relaxed_provider_schema(monkeypatch):
     captured = []
 
@@ -1667,3 +1702,58 @@ def test_validator_accepts_city_context_line():
         {"extracted_fields": {"username": "Bob"}, "saved_city": "Houston"},
     )
     assert validation["valid"] is True
+
+
+def test_send_clarify_records_ai_message(monkeypatch):
+    """Regression: clarify turn must appear in the messages channel so it
+    renders in LangGraph Dev (previously only sent via Telegram side channel)."""
+    from langchain_core.messages import AIMessage
+
+    sent = []
+    monkeypatch.setattr(nodes, "_model", lambda: FakeModel(content="Which date works?"))
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_clarify(
+        {"chat_id": "888", "user_message_content": "book me", "conversation_turn": {}}
+    )
+
+    assert command.goto == nodes.END
+    msgs = command.update["messages"]
+    assert len(msgs) == 1 and isinstance(msgs[0], AIMessage)
+    assert msgs[0].content == sent[-1]["text"] == command.update["direct_response"]
+
+
+def test_send_user_confirmation_records_ai_message(monkeypatch):
+    """Regression: the appointment confirmation draft must be recorded as an
+    AIMessage so it survives the downstream interrupt and renders in Dev."""
+    from langchain_core.messages import AIMessage
+
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.send_user_confirmation(
+        {
+            "chat_id": "888",
+            "appt_draft": "Draft: Green River Dental. Confirm?",
+            "user_message_classification": {"intent": "appointment"},
+        }
+    )
+
+    assert command.goto == "interpret_user_confirmation"
+    msgs = command.update["messages"]
+    assert len(msgs) == 1 and isinstance(msgs[0], AIMessage)
+    assert msgs[0].content == "Draft: Green River Dental. Confirm?" == sent[-1]["text"]
+
+
+def test_receive_message_records_human_message(monkeypatch):
+    """Regression: inbound user text is recorded as a HumanMessage."""
+    from langchain_core.messages import HumanMessage
+
+    command = nodes.receive_message(
+        {"chat_id": "888", "user_message_content": "Book Green River Dental"}
+    )
+
+    assert command.goto == "ensure_user"
+    msgs = command.update["messages"]
+    assert len(msgs) == 1 and isinstance(msgs[0], HumanMessage)
+    assert msgs[0].content == "Book Green River Dental"

@@ -209,7 +209,8 @@ def _is_missing_appointment_value(value: Any) -> bool:
     return not normalized or normalized in {"not specified", "unknown", "none", "n/a", "null"}
 
 
-def appointment_detail_items(details: dict[str, Any]) -> list[tuple[str, str]]:
+def appointment_detail_items(details: dict[str, Any] | None) -> list[tuple[str, str]]:
+    details = details or {}
     return [
         (field, str(details[field]).strip())
         for field in APPOINTMENT_CONFIRMATION_FIELD_ORDER
@@ -228,7 +229,8 @@ def appointment_confirmation_text(details: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def profile_confirmation_text(extracted: dict[str, Any], saved_city: str | None = None) -> str:
+def profile_confirmation_text(extracted: dict[str, Any] | None, saved_city: str | None = None) -> str:
+    extracted = extracted or {}
     header_len = 3
     lines = [profile_privacy_text(), "", "Confirm info to store:"]
     if username := extracted.get("username"):

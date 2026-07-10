@@ -1311,6 +1311,11 @@ def draft_appointment_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
+    # Structured-output extraction can return None when the model emits no valid
+    # tool call (intermittent with gpt-oss). Coerce to an empty detail set so the
+    # confirmation text falls back to asking for more info instead of crashing.
+    if details is None:
+        details = {}
     fallback = appointment_confirmation_text(details)
     draft, validation_errors = _write_validated_text(
         "appointment_confirmation",
@@ -1366,6 +1371,10 @@ def draft_user_info_storage_details(
         SystemMessage(content=extract_system),
         HumanMessage(content=user_message_content),
     ])
+    # Same None-guard as draft_appointment_details: a failed structured-output
+    # call must not crash the draft; treat it as "nothing extracted".
+    if extracted is None:
+        extracted = {}
     fallback = profile_confirmation_text(extracted, saved_city=saved_city)
     draft, validation_errors = _write_validated_text(
         "store_user_info_draft",
