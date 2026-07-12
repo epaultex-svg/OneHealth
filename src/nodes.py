@@ -65,6 +65,7 @@ from conversation import (
     patient_retry_text,
     profile_confirmation_text,
     saved_text,
+    booking_intro_text,
     scheduling_loading_text,
 )
 from profile_retrieval import get_retrievable_profile
@@ -951,6 +952,7 @@ def plan_next_turn(
 ) -> Command[
     Literal[
         "draft_appointment_details",
+        "start_nexhealth_scheduling",
         "draft_user_info_storage_details",
         "request_user_location",
         "store_user_location",
@@ -1015,6 +1017,7 @@ def classify_intent(
 ) -> Command[
     Literal[
         "draft_appointment_details",
+        "start_nexhealth_scheduling",
         "draft_user_info_storage_details",
         "request_user_location",
         "store_user_location",
@@ -1610,7 +1613,7 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
 
 def start_nexhealth_scheduling(state: OneHealthAgentState) -> Command[Literal["get_institution"]]:
     """Start confirmed NexHealth scheduling workflow."""
-    msg = _reply(state["chat_id"], scheduling_loading_text(), remove_keyboard=True)
+    msg = _reply(state["chat_id"], booking_intro_text(), remove_keyboard=True)
     return Command(update={"messages": [msg]}, goto="get_institution")
 
 

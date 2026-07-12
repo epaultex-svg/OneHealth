@@ -221,7 +221,7 @@ def appointment_detail_items(details: dict[str, Any] | None) -> list[tuple[str, 
 def appointment_confirmation_text(details: dict[str, Any]) -> str:
     items = appointment_detail_items(details)
     if not items:
-        return "I need a little more detail before confirming. What specialty, provider, date, or reason should I use?"
+        return "I'll help you book an appointment. Reply **yes** to start choosing a provider and time, or Cancel."
 
     lines = ["Confirm appointment details:"]
     lines.extend(f"- {field}: {value}" for field, value in items)
@@ -259,6 +259,10 @@ def saved_text() -> str:
 
 def scheduling_loading_text() -> str:
     return "Searching appointment options now."
+
+
+def booking_intro_text() -> str:
+    return "Let's get you booked. I'll walk you through a few quick choices."
 
 
 def no_locations_text() -> str:

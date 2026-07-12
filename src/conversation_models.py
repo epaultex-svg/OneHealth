@@ -32,6 +32,7 @@ ConversationRoute = Literal[
     "request_user_location",
     "store_user_location",
     "draft_appointment",
+    "start_booking",
     "view_appointments",
     "handle_confirmation",
     "handle_correction",
