@@ -466,7 +466,7 @@ checkpointer runs `.setup()` in `server.py` and manages its own tables.
 
 `tools.store_info` intentionally ignores `appt_details` on write — bookings now live in
 the `appointments` table, not on the user row. `location`/`insurance`/`patient_info`
-overwrite; `browserbase_context_ids` append.
+overwrite.
 
 ---
 

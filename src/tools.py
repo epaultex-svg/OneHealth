@@ -9,7 +9,6 @@ import requests
 from dotenv import load_dotenv
 from langchain.tools import tool
 from firecrawl import Firecrawl
-from stagehand import AsyncStagehand
 from supabase import create_client
 
 from geocoding import reverse_geocode_city
@@ -227,7 +226,6 @@ def store_info(
     `{"latitude": float, "longitude": float}`; `insurance` is a free-form
     dict, e.g. `{"provider": str, "member_id": str, "group_id": str}`;
     `patient_info` stores NexHealth demographics).
-    `browserbase_context_ids` is append-only; existing entries are preserved.
     `appt_details` is ignored because normalized booking records now live in
     the `appointments` table.
     """
@@ -240,7 +238,6 @@ def store_info(
     existing = client.table("users").select("*").eq("chat_id", chat_id).execute()
     row = existing.data[0] if existing.data else {
         "chat_id": chat_id,
-        "browserbase_context_ids": [],
     }
 
     fields_written: list[str] = []
@@ -260,11 +257,6 @@ def store_info(
             stored_location["city"] = city
         row["location"] = stored_location
         fields_written.append("location")
-    if website and context_id:
-        row["browserbase_context_ids"] = (row.get("browserbase_context_ids") or []) + [
-            {"website": website, "context_id": context_id}
-        ]
-        fields_written.append("browserbase_context_ids")
     if insurance is not None:
         row["insurance"] = insurance
         fields_written.append("insurance")
