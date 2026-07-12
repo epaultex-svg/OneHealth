@@ -104,13 +104,22 @@ deferred here and are OUT OF SCOPE of that plan.
   firing inconsistently on clear requests. `coerce_turn` /
   `route_name_from_intent` (`src/conversation_policy.py:265-322`) then map the chosen
   intent to a node, so a `clarify` classification ends the flow at `send_clarify`.
+- **Status:** Fix #1 SHIPPED (Provider_agent_alternative branch). Deterministic
+  appointment-verb pre-routes added to `deterministic_turn_for_message`
+  (`src/conversation_policy.py`). Routing-flake harness over the 6 appointment eval
+  rows (N=10 each, real planner): **0/6 flaky** — `oh-trajectory-017`
+  ("show my upcoming appointments") now `view_appointments` 10/10 (was ~1-in-4-5),
+  and rows 001/016 ("book a filling/cleaning with Jonas Salk", no literal "appointment"
+  noun) now `draft_appointment_details` 10/10 via the clinical-token path. #2-#4 remain.
 - **Proposed fixes (in order of leverage for the demo):**
-  1. **Deterministic keyword/regex pre-route before the LLM.** For high-signal verbs,
-     bypass the planner: e.g. `show|see|list|view|check ... appointment(s)` →
-     `appointment_view`; `book|schedule|make ... appointment` → `appointment_book`;
-     `cancel|reschedule ... appointment` → the respective intents. Only fall through
-     to `plan_conversation_turn` when no keyword rule matches. Highest reliability, no
-     model dependency for the demo phrasings.
+  1. **[DONE] Deterministic keyword/regex pre-route before the LLM.** For high-signal verbs,
+     bypass the planner: `show|see|list|view|check ... appointment(s)` →
+     `appointment_view`; `book|schedule|make ... appointment` (+ date/clinical detail, or
+     a clinical token even without the noun) → `appointment_book`; `reschedule|move|push`
+     and `cancel|delete|drop ... appointment` → the respective intents. Falls through to
+     `plan_conversation_turn` only when no keyword rule matches, and is gated to idle step
+     so `awaiting_*` sub-flow replies still route through the model. Highest reliability,
+     no model dependency for the demo phrasings.
   2. **Loosen the clarify bias.** Lower the `confidence < 0.65` gate, and don't force
      "generic booking → clarify" when an explicit appointment verb + target is present.
   3. **Pin determinism.** Add a fixed seed if the OpenRouter model supports it, or pick

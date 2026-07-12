@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from conversation import is_cancel_text
@@ -15,6 +16,7 @@ TOP_LEVEL_ACTIONS: list[ConversationRoute] = [
     "request_user_location",
     "store_user_location",
     "draft_appointment",
+    "start_booking",
     "view_appointments",
     "clarify",
 ]
@@ -26,6 +28,7 @@ NODE_FOR_ROUTE: dict[str, str] = {
     "request_user_location": "request_user_location",
     "store_user_location": "store_user_location",
     "draft_appointment": "draft_appointment_details",
+    "start_booking": "start_nexhealth_scheduling",
     "view_appointments": "view_appointments",
     "handle_confirmation": "interpret_user_confirmation",
     "handle_correction": "correct_info",
@@ -103,6 +106,53 @@ def _is_generic_appointment_request(text: str) -> bool:
         "i'd like an appointment",
     }
     return stripped in generic_requests
+
+
+# High-signal appointment routing. Text is already normalized (lowercased,
+# whitespace-collapsed) before these run. Word-boundary regex avoids substring
+# false positives ("bookkeeping", "checkout"). Verb sets are disjoint so at most
+# one intent matches per message.
+_APPT_NOUN = r"\b(?:appointments?|appts?)\b"
+_VIEW_RE = re.compile(
+    rf"(?:\b(?:show|see|list|view|check)\b.*{_APPT_NOUN})"
+    rf"|(?:\bupcoming\b.*{_APPT_NOUN})"
+    rf"|(?:\b(?:do i have|what are my|what'?s my|whats my)\b.*{_APPT_NOUN})"
+)
+_APPT_NOUN_RE = re.compile(_APPT_NOUN)
+_RESCHEDULE_RE = re.compile(rf"\b(?:reschedule|move|push)\b.*{_APPT_NOUN}")
+_CANCEL_RE = re.compile(rf"\b(?:cancel|delete|drop)\b.*{_APPT_NOUN}")
+_BOOK_VERB_RE = re.compile(r"\b(?:book|schedule|make|create|reserve|set ?up)\b")
+# Clinical detail: a specialty / reason / provider token. High enough signal to
+# route a booking even without the literal word "appointment" (e.g. "book a
+# cleaning with Dr Salk"). Deliberately excludes bare dates so non-clinical
+# "book a table tomorrow" is NOT hijacked. (Orthodontist is intentionally absent
+# to keep that phrasing on the LLM prompt path.)
+_APPT_CLINICAL_RE = re.compile(
+    r"\b(?:dental|dentist|cleaning|checkup|check-up|physical|derma\w*|cardio\w*|optometr\w*"
+    r"|eye exam|vaccine|flu shot|x-?ray|filling|crown|root canal|therapy|consultation"
+    r"|screening|blood test|lab|new patient|doctor|provider)\b|\bdr\.?\b"
+)
+# Any concrete detail: clinical tokens plus date/time. Used only once the appt
+# noun is already present, so a date is enough to mean a real booking.
+_APPT_DETAIL_RE = re.compile(
+    r"\b(?:today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|next week|this week|next month|morning|afternoon|evening|noon"
+    r"|january|february|march|april|may|june|july|august|september|october|november|december)\b"
+    r"|\bat \d|\b\d{1,2}:\d{2}\b|\b\d{1,2}\s?(?:am|pm)\b"
+)
+
+
+def _has_appointment_detail(text: str) -> bool:
+    """True when raw text carries a concrete appointment detail (date/time,
+    specialty/reason, or provider) — the prompt's own bar for appointment_book."""
+    return bool(_APPT_DETAIL_RE.search(text) or _APPT_CLINICAL_RE.search(text))
+
+
+def _is_idle_step(state: dict[str, Any]) -> bool:
+    """True when the conversation is not inside an awaiting_* sub-flow, so a
+    high-signal appointment verb is safe to deterministically pre-route."""
+    step = state.get("current_step") or state.get("pending_step") or "idle"
+    return step == "idle"
 
 
 def requested_profile_fields(text: str) -> tuple[list[str], list[str], bool]:
@@ -236,16 +286,92 @@ def deterministic_turn_for_message(msg: dict[str, Any], state: dict[str, Any]) -
 
     if _is_generic_appointment_request(text):
         return {
-            "intent": "clarify",
+            "intent": "appointment_book",
             "confidence": 1.0,
-            "action": "clarify",
+            "action": "start_booking",
             "requested_fields": [],
-            "missing_fields": ["appointment_type_or_reason", "preferred_date"],
+            "missing_fields": [],
             "appointment_action": "book",
             "decision": None,
             "safety_flags": [],
-            "reason": "generic_appointment_request_missing_details",
+            "reason": "generic_appointment_request_enters_scheduling",
         }
+
+    # High-signal appointment verbs: route deterministically so demo phrasings
+    # never depend on the flaky LLM planner. Only when idle (an awaiting_* sub-flow
+    # still routes through the model so protocol replies are not hijacked).
+    if _is_idle_step(state):
+        if _VIEW_RE.search(text):
+            return {
+                "intent": "appointment_view",
+                "confidence": 1.0,
+                "action": "view_appointments",
+                "requested_fields": [],
+                "missing_fields": [],
+                "appointment_action": "view",
+                "decision": None,
+                "safety_flags": [],
+                "reason": "deterministic_appointment_view",
+            }
+        if _RESCHEDULE_RE.search(text):
+            return {
+                "intent": "appointment_reschedule",
+                "confidence": 1.0,
+                "action": "direct_response",
+                "requested_fields": [],
+                "missing_fields": [],
+                "appointment_action": "reschedule",
+                "decision": None,
+                "safety_flags": [],
+                "reason": "deterministic_appointment_reschedule",
+            }
+        if _CANCEL_RE.search(text):
+            return {
+                "intent": "appointment_cancel",
+                "confidence": 1.0,
+                "action": "direct_response",
+                "requested_fields": [],
+                "missing_fields": [],
+                "appointment_action": "cancel",
+                "decision": None,
+                "safety_flags": [],
+                "reason": "deterministic_appointment_cancel",
+            }
+        if _BOOK_VERB_RE.search(text):
+            has_noun = bool(_APPT_NOUN_RE.search(text))
+            book_turn = {
+                "intent": "appointment_book",
+                "confidence": 1.0,
+                "action": "draft_appointment",
+                "requested_fields": [],
+                "missing_fields": [],
+                "appointment_action": "book",
+                "decision": None,
+                "safety_flags": [],
+                "reason": "deterministic_appointment_book",
+            }
+            if has_noun:
+                # "...appointment..." — a date/time or clinical detail confirms a
+                # real booking (draft->confirm); a bare "book an appointment"
+                # enters the scheduling flow directly (option buttons + patient loop).
+                if _has_appointment_detail(text):
+                    return book_turn
+                return {
+                    "intent": "appointment_book",
+                    "confidence": 1.0,
+                    "action": "start_booking",
+                    "requested_fields": [],
+                    "missing_fields": [],
+                    "appointment_action": "book",
+                    "decision": None,
+                    "safety_flags": [],
+                    "reason": "book_verb_enters_scheduling",
+                }
+            # No "appointment" noun: only a clinical token ("book a cleaning with
+            # Dr Salk") is enough signal. Otherwise fall through to the LLM so
+            # non-clinical "book a table tomorrow" is not misrouted.
+            if _APPT_CLINICAL_RE.search(text):
+                return book_turn
 
     return None
 

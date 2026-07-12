@@ -276,20 +276,11 @@ def test_plan_conversation_turn_handles_none_structured_output():
     assert turn["reason"] == "planner_returned_no_structured_output"
 
 
-def test_classify_intent_clarifies_generic_appointment_request(monkeypatch):
-    monkeypatch.setattr(
-        conversation_engine,
-        "_model",
-        lambda temperature=0.0: FakeModel(
-            {
-                "intent": "appointment_book",
-                "confidence": 0.99,
-                "action": "draft_appointment",
-                "appointment_action": "book",
-                "reason": "model would otherwise route to booking",
-            }
-        ),
-    )
+def test_classify_intent_generic_appointment_request_enters_scheduling(monkeypatch):
+    # A detail-less booking request must not dead-end at clarify. It enters the
+    # NexHealth scheduling pipeline directly, which collects everything via option
+    # buttons + the patient loop. Deterministic route — the planner is never consulted.
+    monkeypatch.setattr(conversation_engine, "_model", _fail_model)
 
     command = nodes.classify_intent(
         {
@@ -299,13 +290,140 @@ def test_classify_intent_clarifies_generic_appointment_request(monkeypatch):
         }
     )
 
-    assert command.goto == "send_clarify"
-    assert command.update["conversation_route"] == "clarify"
-    assert command.update["user_message_classification"]["intent"] == "clarify"
-    assert command.update["conversation_turn"]["missing_fields"] == [
-        "appointment_type_or_reason",
-        "preferred_date",
-    ]
+    assert command.goto == "start_nexhealth_scheduling"
+    assert command.update["conversation_route"] == "start_booking"
+    assert command.update["user_message_classification"]["intent"] == "appointment"
+    assert command.update["conversation_turn"]["intent"] == "appointment_book"
+    assert command.update["conversation_turn"]["missing_fields"] == []
+    assert (
+        command.update["conversation_turn"]["reason"]
+        == "generic_appointment_request_enters_scheduling"
+    )
+
+
+def _fail_model(*args, **kwargs):
+    pytest.fail("high-signal appointment phrasing should route deterministically")
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "show my upcoming appointments",
+        "list my appointments",
+        "can you show me my appointment",
+        "check my appointment",
+        "what are my appointments",
+        "do i have any appointments",
+    ],
+)
+def test_classify_intent_routes_appointment_view_without_model(monkeypatch, message):
+    monkeypatch.setattr(conversation_engine, "_model", _fail_model)
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: pytest.fail("should not interrupt seeded input"))
+
+    command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": message, "classify_current_message": True}
+    )
+
+    assert command.goto == "view_appointments"
+    assert command.update["conversation_route"] == "view_appointments"
+    assert command.update["conversation_turn"]["intent"] == "appointment_view"
+    assert command.update["conversation_turn"]["reason"] == "deterministic_appointment_view"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "book a dental cleaning appointment next tuesday",
+        "schedule an appointment for tomorrow at 2pm",
+        "make me an appointment with dr smith",
+        "i want to book an appointment for a physical",
+        # No literal "appointment" noun, but a clinical token is enough signal.
+        "book me a filling with jonas salk",
+        "book a cleaning with dr salk",
+    ],
+)
+def test_classify_intent_routes_appointment_book_with_detail_without_model(monkeypatch, message):
+    monkeypatch.setattr(conversation_engine, "_model", _fail_model)
+    monkeypatch.setattr(nodes, "interrupt", lambda payload: pytest.fail("should not interrupt seeded input"))
+
+    command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": message, "classify_current_message": True}
+    )
+
+    assert command.goto == "draft_appointment_details"
+    assert command.update["conversation_route"] == "draft_appointment"
+    assert command.update["conversation_turn"]["intent"] == "appointment_book"
+    assert command.update["conversation_turn"]["reason"] == "deterministic_appointment_book"
+
+
+def test_classify_intent_book_verb_without_detail_enters_scheduling(monkeypatch):
+    monkeypatch.setattr(conversation_engine, "_model", _fail_model)
+
+    command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "can you book an appointment", "classify_current_message": True}
+    )
+
+    assert command.goto == "start_nexhealth_scheduling"
+    assert command.update["conversation_route"] == "start_booking"
+    assert command.update["conversation_turn"]["intent"] == "appointment_book"
+    assert command.update["conversation_turn"]["reason"] == "book_verb_enters_scheduling"
+
+
+def test_start_nexhealth_scheduling_sends_orienting_preamble(monkeypatch):
+    # UX: detail-less booking lands on an orienting preamble (wayfinding), not a
+    # content-free "reply yes" gate, then flows straight into option selection.
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+
+    command = nodes.start_nexhealth_scheduling({"chat_id": "888"})
+
+    assert command.goto == "get_institution"
+    assert sent[-1]["text"] == conversation.booking_intro_text()
+    assert sent[-1]["remove_keyboard"] is True
+
+
+def test_classify_intent_routes_reschedule_without_model(monkeypatch):
+    monkeypatch.setattr(conversation_engine, "_model", _fail_model)
+
+    command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "reschedule my appointment", "classify_current_message": True}
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["conversation_turn"]["intent"] == "appointment_reschedule"
+
+
+def test_classify_intent_cancel_my_appointment_routes_to_cancel_not_general(monkeypatch):
+    monkeypatch.setattr(conversation_engine, "_model", _fail_model)
+
+    command = nodes.classify_intent(
+        {"chat_id": "888", "user_message_content": "cancel my appointment", "classify_current_message": True}
+    )
+
+    assert command.goto == "send_direct_response"
+    assert command.update["conversation_turn"]["intent"] == "appointment_cancel"
+    assert command.update["conversation_turn"]["reason"] == "deterministic_appointment_cancel"
+
+
+def test_deterministic_appointment_rules_gate_on_idle_step():
+    from conversation_policy import deterministic_turn_for_message
+
+    msg = {"user_message_content": "show my upcoming appointments"}
+
+    idle_turn = deterministic_turn_for_message(msg, {"current_step": "idle"})
+    assert idle_turn is not None
+    assert idle_turn["intent"] == "appointment_view"
+
+    # Mid sub-flow: falls through to the LLM so protocol replies are not hijacked.
+    assert deterministic_turn_for_message(msg, {"current_step": "awaiting_confirmation"}) is None
+
+    # Non-clinical booking with no "appointment" noun must NOT be hijacked.
+    assert (
+        deterministic_turn_for_message(
+            {"user_message_content": "book a table tomorrow"}, {"current_step": "idle"}
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -316,9 +434,11 @@ def test_classify_intent_clarifies_generic_appointment_request(monkeypatch):
         ("What kinds of pediatric dental appointments can OneHealth support?", "general_info", "send_direct_response"),
         ("Can OneHealth handle eye exam appointments?", "general_info", "send_direct_response"),
         ("Can you update my insurance?", "general_info", "send_direct_response"),
-        ("Book a dermatology appointment tomorrow.", "appointment", "draft_appointment_details"),
+        # Booking phrasings with "appointment" + a concrete detail now pre-route
+        # deterministically (see deterministic_appointment_book tests) and no longer
+        # reach the LLM prompt. This case has no "appointment" noun, so the
+        # deterministic layer falls through to the model and still exercises the prompt.
         ("Please schedule an orthodontist visit next week.", "appointment", "draft_appointment_details"),
-        ("Set up a pediatric dental appointment for Friday.", "appointment", "draft_appointment_details"),
         ("I need to reschedule my eye exam.", "appointment_reschedule", "send_direct_response"),
     ],
 )
@@ -557,7 +677,11 @@ def test_appointment_confirmation_text_omits_missing_fields_and_includes_provide
     assert text.endswith("Does this look right?")
 
 
-def test_appointment_confirmation_text_empty_details_asks_for_more_detail():
+def test_appointment_confirmation_text_empty_details_offers_proceed_or_cancel():
+    # Defensive: the detail-less path no longer reaches this (it enters scheduling
+    # directly). But a with-details draft can still extract empty. The empty-case
+    # text must be a proceed/cancel line, not an open question — interpret_user_confirmation
+    # only classifies yes/no, so an open question would trap the user.
     text = conversation.appointment_confirmation_text(
         {
             "Date": "not specified",
@@ -566,7 +690,8 @@ def test_appointment_confirmation_text_empty_details_asks_for_more_detail():
         }
     )
 
-    assert "more detail" in text
+    assert "yes" in text.lower()
+    assert "Cancel" in text
     assert "Does this look right?" not in text
 
 
