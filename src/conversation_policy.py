@@ -128,7 +128,7 @@ _BOOK_VERB_RE = re.compile(r"\b(?:book|schedule|make|create|reserve|set ?up)\b")
 # "book a table tomorrow" is NOT hijacked. (Orthodontist is intentionally absent
 # to keep that phrasing on the LLM prompt path.)
 _APPT_CLINICAL_RE = re.compile(
-    r"\b(?:dental|dentist|cleaning|checkup|check-up|physical|derma\w*|cardio\w*|optometr\w*"
+    r"\b(?:dental|dentist|cleaning|checkup|check-up|physical|derma\w*|cardio\w*|optometry\w*"
     r"|eye exam|vaccine|flu shot|x-?ray|filling|crown|root canal|therapy|consultation"
     r"|screening|blood test|lab|new patient|doctor|provider)\b|\bdr\.?\b"
 )
