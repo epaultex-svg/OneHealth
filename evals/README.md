@@ -38,10 +38,36 @@ UX assertions live under `expected_result.ux_assertions` in dataset rows:
     "profile_privacy_copy": true,
     "cancel_flow": true,
     "invalid_choice_retry": true,
-    "telegram_buttons": true
+    "telegram_buttons": true,
+    "view_lists_appointments": true,
+    "booking_deduplicated": true
   }
 }
 ```
+
+- `view_lists_appointments`: passes when the trajectory hits `view_appointments`
+  and either `viewed_appointments` is non-empty or the message lists an upcoming
+  appointment. Used by `oh-trajectory-017`.
+- `booking_deduplicated`: passes when `book_appointment` ran, an
+  `appointment_booking_status` is set, and `book_appointment_result` is unset — the
+  signature of a dedup that skipped the NexHealth POST. Used by `oh-trajectory-018`.
+
+## Coverage notes
+
+- **Viewing appointments** (`oh-trajectory-017`) is covered live, happy-path only
+  (one seeded patient can't produce the empty-list or no-patient-record branches).
+  Those branches are deferred to the mocked offline runner (see `docs/TODOS.md`).
+- **Booking idempotency** is deterministically guaranteed by
+  `tests/test_graph_regressions.py` (`test_book_appointment_dedups_existing_booked_reservation`,
+  `test_book_appointment_retries_after_failed_reservation`). The `oh-trajectory-018`
+  (duplicate) and `oh-trajectory-019` (retry-after-failure) dataset rows are the
+  integration counterparts and form an **ordered pair**: they need the booking key
+  already present in the Postgres `appointments` ledger (as `booked` / `failed`
+  respectively) to score live, so run them after a happy booking or under the mocked
+  runner. They are not part of the standard live smoke.
+- Existing trajectory rows begin with `start_thread`; the live graph actually starts
+  `receive_message -> ensure_user -> plan_next_turn`. `oh-trajectory-017` is pinned to
+  the real order. Re-baselining the older rows is tracked in `docs/TODOS.md`.
 
 Upload deterministic evaluators to the dataset:
 

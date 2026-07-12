@@ -1757,3 +1757,70 @@ def test_receive_message_records_human_message(monkeypatch):
     msgs = command.update["messages"]
     assert len(msgs) == 1 and isinstance(msgs[0], HumanMessage)
     assert msgs[0].content == "Book Green River Dental"
+
+
+def test_book_appointment_dedups_existing_booked_reservation(monkeypatch):
+    """Idempotency: a booking whose key is already `booked` must NOT re-POST.
+
+    reserve_appointment_booking returns should_book=False for an existing booked
+    row. book_appointment must skip the NexHealth POST, surface the prior status,
+    and leave book_appointment_result unset (the only final-state signal that
+    distinguishes a dedup from a fresh booking).
+    """
+    post_calls = []
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(
+        nodes,
+        "reserve_appointment_booking",
+        lambda **kwargs: {"status": "booked", "should_book": False},
+    )
+    monkeypatch.setattr(nodes, "_write_validated_text", lambda route, ctx, fallback: (fallback, []))
+
+    def fail_if_called(*args, **kwargs):
+        post_calls.append((args, kwargs))
+        raise AssertionError("NexHealth POST must not fire on a duplicate booking")
+
+    monkeypatch.setattr(nodes, "_nexhealth_request", fail_if_called)
+
+    command = nodes.book_appointment(_booking_state())
+
+    assert post_calls == []
+    assert command.update["appointment_booking_status"] == "booked"
+    assert "book_appointment_result" not in command.update
+    assert command.goto == nodes.END
+    assert sent, "duplicate booking should still send a confirmation message"
+
+
+def test_book_appointment_retries_after_failed_reservation(monkeypatch):
+    """Idempotency guard must NOT over-block: a prior `failed` row is retried.
+
+    reserve_appointment_booking moves a failed row back to pending and returns
+    should_book=True, so book_appointment should POST to NexHealth and mark the
+    booking booked.
+    """
+    post_calls = []
+    marked = []
+    sent = []
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: sent.append(payload)))
+    monkeypatch.setattr(
+        nodes,
+        "reserve_appointment_booking",
+        lambda **kwargs: {"status": "pending", "should_book": True},
+    )
+    monkeypatch.setattr(nodes, "_write_validated_text", lambda route, ctx, fallback: (fallback, []))
+
+    def fake_post(*args, **kwargs):
+        post_calls.append((args, kwargs))
+        return ({"appointment": {"id": "999"}}, {"nexhealth_bearer_token": "token"})
+
+    monkeypatch.setattr(nodes, "_nexhealth_request", fake_post)
+    monkeypatch.setattr(nodes, "mark_appointment_booked", lambda **kwargs: marked.append(kwargs) or {})
+
+    command = nodes.book_appointment(_booking_state())
+
+    assert len(post_calls) == 1
+    assert marked and marked[0]["nexhealth_appointment_id"] == "999"
+    assert command.update["appointment_booking_status"] == "booked"
+    assert command.update["book_appointment_result"] == {"appointment": {"id": "999"}}
+    assert command.goto == nodes.END

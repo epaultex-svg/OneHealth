@@ -55,7 +55,7 @@ The graph skips selection prompts when it can safely auto-select one option, suc
 | Area | Technology |
 |------|------------|
 | Agent orchestration | LangGraph |
-| LLM provider | OpenRouter via `langchain-openrouter` |
+| LLM | `openai/gpt-oss-120b` via OpenRouter (`langchain-openrouter`) |
 | Messaging | Telegram Bot API |
 | API server | FastAPI, Uvicorn |
 | Scheduling | NexHealth API |
@@ -67,20 +67,29 @@ The graph skips selection prompts when it can safely auto-select one option, suc
 
 ## Project Structure
 
+All runtime modules live under `src/`. Imports inside `src/` are flat
+(`from nodes import ...`), so `src/` must be on `sys.path` at runtime — `langgraph
+dev` reads it from `langgraph.json`, `uvicorn` needs `--app-dir src`, and pytest gets
+it from `tests/conftest.py`.
+
 | Path | Purpose |
 |------|---------|
-| [agent.py](agent.py) | Builds and compiles the LangGraph workflow |
-| [nodes.py](nodes.py) | Graph nodes, NexHealth helpers, profile flow, booking flow |
-| [state.py](state.py) | Shared graph state and typed payloads |
-| [conversation_engine.py](conversation_engine.py) | LLM planner and route-specific writer |
-| [conversation_policy.py](conversation_policy.py) | Deterministic overrides and route-to-node mapping |
-| [conversation.py](conversation.py) | User-facing copy, keyboards, cancel/retry behavior |
-| [message_validation.py](message_validation.py) | Safety checks for generated responses |
-| [tools.py](tools.py) | Telegram, Supabase, and legacy Firecrawl tools |
-| [appointments.py](appointments.py) | Normalized appointment booking persistence |
-| [server.py](server.py) | FastAPI webhook app |
-| [webhook_store.py](webhook_store.py) | Postgres-backed Telegram update ledger |
-| [webhook_worker.py](webhook_worker.py) | Single-process worker that invokes or resumes graph threads |
+| [src/agent.py](src/agent.py) | Builds and compiles the LangGraph workflow |
+| [src/nodes.py](src/nodes.py) | Graph nodes, NexHealth helpers, profile flow, booking flow |
+| [src/state.py](src/state.py) | Shared graph state and typed payloads |
+| [src/conversation_engine.py](src/conversation_engine.py) | LLM planner and route-specific writer |
+| [src/conversation_policy.py](src/conversation_policy.py) | Deterministic overrides and route-to-node mapping |
+| [src/conversation.py](src/conversation.py) | User-facing copy, keyboards, cancel/retry behavior |
+| [src/message_validation.py](src/message_validation.py) | Safety checks for generated responses |
+| [src/profile_retrieval.py](src/profile_retrieval.py) | Profile read + privacy boundary |
+| [src/geocoding.py](src/geocoding.py) | Reverse-geocode coordinates to a city name |
+| [src/tools.py](src/tools.py) | Telegram, Supabase, and legacy Firecrawl tools |
+| [src/appointments.py](src/appointments.py) | Normalized appointment booking persistence |
+| [src/db.py](src/db.py) | Table DDL for `telegram_updates` and `appointments` |
+| [src/server.py](src/server.py) | FastAPI webhook app |
+| [src/telegram_webhook.py](src/telegram_webhook.py) | Update normalization and secret check |
+| [src/webhook_store.py](src/webhook_store.py) | Postgres-backed Telegram update ledger |
+| [src/webhook_worker.py](src/webhook_worker.py) | Single-process worker that invokes or resumes graph threads |
 | [evals/](evals/) | LangSmith runner and deterministic evaluators |
 | [tests/](tests/) | Pytest suite |
 
@@ -135,20 +144,20 @@ ONEHEALTH_LANGSMITH_DATASET="OneHealth Trajectory Dataset"
 Compile-check source files:
 
 ```bash
-uv run python -m compileall agent.py nodes.py tools.py state.py db.py appointments.py \
-  telegram_webhook.py webhook_store.py webhook_worker.py server.py tests
+uv run python -m compileall src tests
 ```
 
-Run LangGraph dev server:
+Run LangGraph dev server (uses `langgraph.json` → `src/agent.py:graph`):
 
 ```bash
 uv run langgraph dev
 ```
 
-Run the production webhook server:
+Run the production webhook server. `src/` modules use flat imports, so pass
+`--app-dir src`:
 
 ```bash
-uv run uvicorn server:app --host 0.0.0.0 --port 8000
+uv run uvicorn server:app --app-dir src --host 0.0.0.0 --port 8000
 ```
 
 Register Telegram webhook:
@@ -237,7 +246,7 @@ OneHealth uses three persistence layers:
 | Postgres `telegram_updates` | Durable webhook queue and duplicate update protection |
 | Postgres `appointments` | Normalized appointment records keyed by booking idempotency key |
 
-`db.py` creates `telegram_updates` and `appointments` with `CREATE TABLE IF NOT EXISTS`.
+`src/db.py` creates `telegram_updates` and `appointments` with `CREATE TABLE IF NOT EXISTS`. LangGraph's `PostgresSaver` checkpointer manages its own tables via `.setup()` in `src/server.py`.
 
 ## Safety and Privacy
 
@@ -268,8 +277,9 @@ OneHealth uses three persistence layers:
 
 ## More Documentation
 
-- [AGENTS.md](AGENTS.md): full state, node, tool, and design reference for coding agents.
-- [ARCHITECTURE.md](ARCHITECTURE.md): deeper architecture explanation.
-- [CONTRIBUTING.md](CONTRIBUTING.md): developer setup and workflow extension guide.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): detailed, branch-specific architecture explanation.
+- [docs/AGENTS.md](docs/AGENTS.md): full state, node, tool, and design reference for coding agents.
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): developer setup and workflow extension guide.
+- [docs/TODOS.md](docs/TODOS.md): tracked backlog and deferred work.
 - [evals/README.md](evals/README.md): LangSmith evaluator usage.
 - [wiki/overview.md](wiki/overview.md): knowledge-base overview and concept links.

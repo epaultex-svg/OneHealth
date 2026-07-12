@@ -178,6 +178,18 @@ def user_experience_assertions_evaluator(run: Any, example: Any) -> dict[str, An
         ),
         "invalid_choice_retry": "i did not recognize" in text,
         "telegram_buttons": _has_keyboard(run_outputs),
+        "view_lists_appointments": (
+            "view_appointments" in trajectory
+            and (
+                bool(final_state.get("viewed_appointments"))
+                or "upcoming appointment" in text
+            )
+        ),
+        "booking_deduplicated": (
+            "book_appointment" in trajectory
+            and bool(final_state.get("appointment_booking_status"))
+            and not final_state.get("book_appointment_result")
+        ),
     }
 
     failures = [

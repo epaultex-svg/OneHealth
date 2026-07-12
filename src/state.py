@@ -1,4 +1,7 @@
-from typing import Literal, Required, TypedDict
+from typing import Annotated, Literal, Required, TypedDict
+
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
 
 from conversation_models import ConversationTurn, RetrievedProfile
 
@@ -68,6 +71,9 @@ class NexHealthOption(TypedDict, total=False):
 
 
 class OneHealthAgentState(TypedDict, total=False):
+    # full conversation transcript, rendered by LangGraph Studio / langgraph dev
+    messages: Annotated[list[AnyMessage], add_messages]
+
     # inbound message information
     chat_id: Required[str]
     update_id: int

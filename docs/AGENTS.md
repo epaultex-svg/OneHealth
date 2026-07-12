@@ -93,13 +93,13 @@ Defined in `nodes.py` and wired in `agent.py`:
 
 ### Turn Planning and Routing
 
-- `plan_next_turn`: Decides how to handle the current turn. Routes appointment booking to the confirmation flow, profile storage to its own flow, direct info requests to `retrieve_info`, and recognized-but-unsupported intents (`appointment_view`, `appointment_reschedule`, `appointment_cancel`) to `send_direct_response` with a graceful "not available yet" message.
+- `plan_next_turn`: Decides how to handle the current turn. Routes appointment booking to the confirmation flow, profile storage to its own flow, direct info requests to `retrieve_info`, appointment viewing to `view_appointments`, and recognized-but-unsupported intents (`appointment_reschedule`, `appointment_cancel`) to `send_direct_response` with a graceful "not available yet" message.
 - `classify_intent`: LLM classifies message intent. Called when the turn planner needs intent before routing.
 - `store_user_location`: Persists a new user-provided Telegram location to Supabase.
 - `retrieve_info`: Returns saved profile fields or other stored data directly to the user.
 - `view_appointments`: Fetches and displays the user's upcoming NexHealth appointments. Collects patient info if not yet on file, searches NexHealth GET /appointments for the next 365 days, and formats each result with a readable date/time, provider name, and appointment type. Requires `NEXHEALTH_LOCATION_ID`. Retried up to 3 times on API failure.
 - `send_clarify`: Sends a clarification request when the user's intent is ambiguous.
-- `send_direct_response`: Sends a one-turn LLM-generated reply for greetings, help, about-assistant, small talk, and unsupported intents (view/reschedule/cancel appointments). Retried up to 3 times on send failure.
+- `send_direct_response`: Sends a one-turn LLM-generated reply for greetings, help, about-assistant, small talk, and unsupported intents (reschedule/cancel appointments). Retried up to 3 times on send failure.
 
 ### Intent and Confirmation
 
@@ -163,5 +163,7 @@ Defined in `nodes.py` and wired in `agent.py`:
 Trajectory evaluation lives in `evals/`:
 
 - `evals/run_onehealth_langsmith_eval.py`: Runs graph against dataset examples and records node trajectory, final state, and captured outbound messages.
-- `evals/onehealth_evaluators.py`: Deterministic evaluators for trajectory matching, expected state subset matching, and UX assertions.
-- `OneHealth_test_dataset.csv`: Scenario coverage for onboarding, location decline, corrections, provider/type selection, no slots, invalid slot retry, cancellation, privacy copy, reply buttons, and preference storage.
+- `evals/onehealth_evaluators.py`: Deterministic evaluators for trajectory matching, expected state subset matching, and UX assertions (incl. `view_lists_appointments` and `booking_deduplicated`).
+- `evals/OneHealth_test_dataset.csv`: Trajectory scenario coverage for onboarding, location decline, corrections, provider/type selection, no slots, invalid slot retry, cancellation, privacy copy, reply buttons, preference storage, **viewing appointments** (`oh-trajectory-017`, live happy-path), and **booking idempotency** (`oh-trajectory-018` duplicate, `oh-trajectory-019` retry-after-failure).
+- Booking idempotency is deterministically guaranteed by `tests/test_graph_regressions.py` (`test_book_appointment_dedups_existing_booked_reservation`, `test_book_appointment_retries_after_failed_reservation`); the 018/019 dataset rows are integration counterparts that need seeded Postgres ledger state to score live.
+- Runner side effects: trajectory rows currently exercise real NexHealth/Supabase/Postgres (the runner ignores each row's `supabase_fixture` block), so `--allow-side-effects` is required. View empty/no-record branches and the mocked offline runner are deferred (see `docs/TODOS.md`).
