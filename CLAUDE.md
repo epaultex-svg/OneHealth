@@ -15,3 +15,7 @@ Key routing rules:
 - Ship/deploy/PR -> invoke /ship or /land-and-deploy
 - Save progress -> invoke /context-save
 - Resume context -> invoke /context-restore
+
+## Edits
+
+When making any significant edits, enter a separate worktree. After you've made the edits and permission is given, merge the worktree back into the target branch (the branch you made the worktree from, unless otherwise specified)
