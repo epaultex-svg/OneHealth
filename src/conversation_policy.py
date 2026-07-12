@@ -28,7 +28,7 @@ NODE_FOR_ROUTE: dict[str, str] = {
     "request_user_location": "request_user_location",
     "store_user_location": "store_user_location",
     "draft_appointment": "draft_appointment_details",
-    "start_booking": "start_nexhealth_scheduling",
+    "start_booking": "booking",
     "view_appointments": "view_appointments",
     "handle_confirmation": "interpret_user_confirmation",
     "handle_correction": "correct_info",

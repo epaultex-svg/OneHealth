@@ -290,7 +290,7 @@ def test_classify_intent_generic_appointment_request_enters_scheduling(monkeypat
         }
     )
 
-    assert command.goto == "start_nexhealth_scheduling"
+    assert command.goto == "booking"  # booking flow is now a subgraph node
     assert command.update["conversation_route"] == "start_booking"
     assert command.update["user_message_classification"]["intent"] == "appointment"
     assert command.update["conversation_turn"]["intent"] == "appointment_book"
@@ -363,7 +363,7 @@ def test_classify_intent_book_verb_without_detail_enters_scheduling(monkeypatch)
         {"chat_id": "888", "user_message_content": "can you book an appointment", "classify_current_message": True}
     )
 
-    assert command.goto == "start_nexhealth_scheduling"
+    assert command.goto == "booking"  # booking flow is now a subgraph node
     assert command.update["conversation_route"] == "start_booking"
     assert command.update["conversation_turn"]["intent"] == "appointment_book"
     assert command.update["conversation_turn"]["reason"] == "book_verb_enters_scheduling"

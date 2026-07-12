@@ -952,7 +952,7 @@ def plan_next_turn(
 ) -> Command[
     Literal[
         "draft_appointment_details",
-        "start_nexhealth_scheduling",
+        "booking",
         "draft_user_info_storage_details",
         "request_user_location",
         "store_user_location",
@@ -1017,7 +1017,7 @@ def classify_intent(
 ) -> Command[
     Literal[
         "draft_appointment_details",
-        "start_nexhealth_scheduling",
+        "booking",
         "draft_user_info_storage_details",
         "request_user_location",
         "store_user_location",
@@ -1428,7 +1428,7 @@ def send_user_confirmation(
 
 def interpret_user_confirmation(
     state: OneHealthAgentState,
-) -> Command[Literal["store_in_supabase", "start_nexhealth_scheduling", "send_correction_query", "__end__"]]:
+) -> Command[Literal["store_in_supabase", "booking", "send_correction_query", "__end__"]]:
     """Wait for user reply, interpret as confirm/deny, route accordingly.
 
     Pauses on interrupt(), reads the latest Telegram
@@ -1471,7 +1471,7 @@ def interpret_user_confirmation(
     if decision["decision"] == "denied":
         next_node = "send_correction_query"
     elif intent == "appointment":
-        next_node = "start_nexhealth_scheduling"
+        next_node = "booking"
     else:
         next_node = "store_in_supabase"
 
