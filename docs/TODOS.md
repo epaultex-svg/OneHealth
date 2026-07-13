@@ -34,14 +34,55 @@
   branches; booking idempotency rows `oh-trajectory-018`/`019` scoring green without
   pre-seeded Postgres ledger state; the 4 unused UX-assertion rows (cancel-before-write,
   privacy, no-slot, invalid-choice).
-- **Also:** Re-baseline the existing 15 trajectory rows — they start with
-  `start_thread`, but the live graph starts `receive_message -> ensure_user ->
-  plan_next_turn`, so their `expected_trajectory` currently mismatches
-  (`oh-trajectory-017` is already pinned to the real order).
+- **Also:** ~~Re-baseline the existing 15 trajectory rows — they start with
+  `start_thread`~~ Done: the harness now passes `subgraphs=True` so booking-subgraph
+  interior nodes stream individually instead of collapsing into one `"booking"` task,
+  and all 19 rows' `resume_sequence` labels are renamed `classify_intent` ->
+  `plan_next_turn` (`classify_intent` is a dead pass-through, `src/nodes.py`
+  ~1015-1030). Remaining: `plan_next_turn` only calls `interrupt()` when
+  `state["classify_current_message"]` is falsy, and `receive_message` sets that
+  `True` for turn 1 — so the first `resume_sequence` entry (which replays the
+  initial message) is now dead weight in most rows; it gets delivered to whichever
+  interrupt is *actually* next instead, shifting every later resume by one.
+  Confirmed live on `oh-trajectory-008` (crashed) and `oh-trajectory-001` (drifted
+  to the wrong appointment type instead of crashing). See the new-user-location
+  entry below for a related, deeper finding from the same investigation.
 - **Also:** Decide the fate of legacy `evals/onehealth_eval_dataset.csv` (22
   single-turn classification rows, wired to nothing; redundant with pytest routing
   tests) — delete or fold into the trajectory set.
 - **Priority:** Medium (post-demo; needed before CI gating / clinic pilot).
+
+## New users bypass location collection before booking
+
+- **What:** `oh-trajectory-001`/`012` assume a brand-new user (`user_exists: false`)
+  gets routed through `request_user_location` -> `await_user_location` -> `onboard`
+  before any booking flow starts. A live run of `oh-trajectory-001` showed
+  `plan_next_turn` going straight from turn 1 to `draft_appointment_details`,
+  skipping that entire branch.
+- **Why:** `plan_next_turn`'s routing comes from the LLM planner
+  (`conversation_engine.plan_conversation_turn`), and `build_planner_prompt`'s state
+  summary only reflects whether *this message* carries a location payload
+  (`has_location_payload`) — it has no visibility into whether the user has a
+  stored location on file at all. There's no deterministic code path (unlike
+  `/add_location`, which `conversation_policy.deterministic_turn_for_message`
+  handles explicitly) that gates a new user into `request_user_location` before
+  booking. Confirm whether this is a real product regression (new users can book
+  without ever sharing a location, which may affect provider/location matching
+  downstream — `get_location` inside the booking subgraph resolves the *NexHealth
+  practice location*, a different concept, and won't ask for GPS coordinates) or
+  whether it's planner nondeterminism on this specific phrasing, same class as the
+  `oh-trajectory-017` flake noted elsewhere in this file.
+- **Also:** Once resolved, `oh-trajectory-001`/`012`'s fixtures/`resume_sequence`
+  need redesigning around whichever behavior is correct — right now they test a
+  path that may not exist anymore.
+- **Verification tip (from manual testing):** slot availability is unreliable across
+  provider/appointment-type combos in the sandbox; a filling appointment with
+  Jonas Salk is the one combo confirmed to reliably have open slots. Note: the
+  user recalled the name as "Dr. John Schulk," which doesn't appear anywhere in
+  the current dataset/tests (only "Jonas Salk" does) — worth double-checking
+  against the live NexHealth sandbox before relying on it, in case it's a second,
+  not-yet-referenced provider rather than the same one misremembered.
+- **Priority:** Medium — blocks correctly redesigning `oh-trajectory-001`/`012`.
 
 ## Agent latency reduction — deferred fixes (#2–#10)
 
