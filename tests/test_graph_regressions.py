@@ -292,6 +292,7 @@ def test_classify_intent_generic_appointment_request_enters_scheduling(monkeypat
 
     assert command.goto == "booking"  # booking flow is now a subgraph node
     assert command.update["conversation_route"] == "start_booking"
+    assert command.update["force_booking_choices"] is True
     assert command.update["user_message_classification"]["intent"] == "appointment"
     assert command.update["conversation_turn"]["intent"] == "appointment_book"
     assert command.update["conversation_turn"]["missing_fields"] == []
@@ -352,6 +353,7 @@ def test_classify_intent_routes_appointment_book_with_detail_without_model(monke
 
     assert command.goto == "draft_appointment_details"
     assert command.update["conversation_route"] == "draft_appointment"
+    assert command.update["force_booking_choices"] is False
     assert command.update["conversation_turn"]["intent"] == "appointment_book"
     assert command.update["conversation_turn"]["reason"] == "deterministic_appointment_book"
 
@@ -365,6 +367,7 @@ def test_classify_intent_book_verb_without_detail_enters_scheduling(monkeypatch)
 
     assert command.goto == "booking"  # booking flow is now a subgraph node
     assert command.update["conversation_route"] == "start_booking"
+    assert command.update["force_booking_choices"] is True
     assert command.update["conversation_turn"]["intent"] == "appointment_book"
     assert command.update["conversation_turn"]["reason"] == "book_verb_enters_scheduling"
 
@@ -380,6 +383,50 @@ def test_start_nexhealth_scheduling_sends_orienting_preamble(monkeypatch):
     assert command.goto == "get_institution"
     assert sent[-1]["text"] == conversation.booking_intro_text()
     assert sent[-1]["remove_keyboard"] is True
+
+
+def test_forced_booking_start_clears_request_specific_state(monkeypatch):
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: None))
+    stale = {
+        **_booking_state(),
+        "force_booking_choices": True,
+        "nexhealth_institution_id": 10,
+        "nexhealth_institution_options": [{"id": 10}],
+        "nexhealth_location_options": [{"id": 1}],
+        "nexhealth_provider_options": [{"id": 2}],
+        "nexhealth_appointment_type_options": [{"id": 4}],
+        "nexhealth_available_slots": [{"time": "2026-05-26T09:00:00-04:00"}],
+        "book_appointment_result": {"id": 99},
+        "nexhealth_appointment_result": {"id": 99},
+        "appointment_booking_key": "old-key",
+        "appointment_booking_status": "booked",
+    }
+
+    command = nodes.start_nexhealth_scheduling(stale)
+
+    assert command.goto == "get_institution"
+    assert command.update["appt_details"] == {}
+    for key in (
+        "nexhealth_institution_id",
+        "nexhealth_institution_subdomain",
+        "nexhealth_location_id",
+        "nexhealth_provider_id",
+        "nexhealth_appointment_type_id",
+        "nexhealth_selected_slot",
+        "book_appointment_result",
+        "nexhealth_appointment_result",
+        "appointment_booking_key",
+        "appointment_booking_status",
+    ):
+        assert command.update[key] is None
+    for key in (
+        "nexhealth_institution_options",
+        "nexhealth_location_options",
+        "nexhealth_provider_options",
+        "nexhealth_appointment_type_options",
+        "nexhealth_available_slots",
+    ):
+        assert command.update[key] == []
 
 
 def test_classify_intent_routes_reschedule_without_model(monkeypatch):
@@ -1081,6 +1128,51 @@ def test_get_institution_with_practice_match_skips_prompt(monkeypatch):
     assert command.update["nexhealth_institution_subdomain"] == "green-river-dental"
 
 
+def test_normal_booking_reuses_cached_institution_without_request(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: pytest.fail("cached institution must skip NexHealth request"),
+    )
+
+    command = nodes.get_institution(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_institution_subdomain": "green-river-dental",
+        }
+    )
+
+    assert command.goto == "get_location"
+
+
+def test_forced_booking_ignores_cached_and_matching_institution(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 100, "name": "Green River Dental", "subdomain": "green-river-dental"},
+                ]
+            },
+            {},
+        ),
+    )
+
+    command = nodes.get_institution(
+        {
+            "chat_id": "888",
+            "force_booking_choices": True,
+            "nexhealth_institution_subdomain": "cached-clinic",
+            "appt_details": {"Practice": "Green River Dental"},
+        }
+    )
+
+    assert command.goto == "send_institution_options"
+    assert [option["id"] for option in command.update["nexhealth_institution_options"]] == [100]
+
+
 def test_get_institution_with_unavailable_practice_warns_and_routes_to_options(monkeypatch):
     monkeypatch.setattr(
         nodes,
@@ -1301,6 +1393,226 @@ def test_get_location_with_practice_match_skips_location_prompt(monkeypatch):
 
     assert command.goto == "get_provider"
     assert command.update["nexhealth_location_id"] == 20
+
+
+def test_normal_booking_uses_configured_location_without_request(monkeypatch):
+    monkeypatch.setenv("NEXHEALTH_LOCATION_ID", "999")
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: pytest.fail("configured location must skip NexHealth request"),
+    )
+
+    command = nodes.get_location(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_institution_subdomain": "green-river-dental",
+        }
+    )
+
+    assert command.goto == "get_provider"
+    assert command.update["nexhealth_location_id"] == 999
+
+
+def test_normal_booking_auto_selects_single_location(monkeypatch):
+    monkeypatch.delenv("NEXHEALTH_LOCATION_ID", raising=False)
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {"data": [{"id": 10, "name": "North Clinic", "city": "Austin"}]},
+            {"nexhealth_bearer_token": "token"},
+        ),
+    )
+
+    command = nodes.get_location(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_institution_subdomain": "green-river-dental",
+        }
+    )
+
+    assert command.goto == "get_provider"
+    assert command.update["nexhealth_location_id"] == 10
+    assert command.update["nexhealth_bearer_token"] == "token"
+
+
+def test_forced_booking_ignores_env_and_single_location(monkeypatch):
+    monkeypatch.setenv("NEXHEALTH_LOCATION_ID", "999")
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {"data": [{"id": 10, "name": "North Clinic", "city": "Austin"}]},
+            {},
+        ),
+    )
+
+    command = nodes.get_location(
+        {
+            "chat_id": "888",
+            "force_booking_choices": True,
+            "nexhealth_institution_subdomain": "green-river-dental",
+            "appt_details": {"Practice": "North Clinic"},
+        }
+    )
+
+    assert command.goto == "send_location_options"
+    assert [option["id"] for option in command.update["nexhealth_location_options"]] == [10]
+
+
+def test_forced_booking_prompts_for_single_provider(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {"data": [{"id": 20, "name": "Dr Smith"}]},
+            {},
+        ),
+    )
+
+    command = nodes.get_provider(
+        {
+            "chat_id": "888",
+            "force_booking_choices": True,
+            "nexhealth_location_id": 10,
+            "user_message_content": "book with Dr Smith",
+            "appt_details": {"Provider": "Dr Smith"},
+        }
+    )
+
+    assert command.goto == "send_provider_options"
+    assert [option["id"] for option in command.update["nexhealth_provider_options"]] == [20]
+
+
+def test_normal_booking_auto_selects_single_provider(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {"data": [{"id": 20, "name": "Dr Smith"}]},
+            {"nexhealth_bearer_token": "token"},
+        ),
+    )
+
+    command = nodes.get_provider(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_location_id": 10,
+        }
+    )
+
+    assert command.goto == "get_patient"
+    assert command.update["nexhealth_provider_id"] == 20
+    assert command.update["nexhealth_bearer_token"] == "token"
+
+
+def test_normal_booking_matches_provider_from_details(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 20, "name": "Dr Smith"},
+                    {"id": 21, "name": "Jonas Salk"},
+                ]
+            },
+            {},
+        ),
+    )
+
+    command = nodes.get_provider(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_location_id": 10,
+            "user_message_content": "book with Jonas Salk",
+            "appt_details": {"Provider": "Jonas Salk"},
+        }
+    )
+
+    assert command.goto == "get_patient"
+    assert command.update["nexhealth_provider_id"] == 21
+
+
+def test_forced_booking_prompts_for_single_appointment_type(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {"data": [{"id": 30, "title": "Cleaning"}]},
+            {},
+        ),
+    )
+
+    command = nodes.get_appointment_type(
+        {
+            "chat_id": "888",
+            "force_booking_choices": True,
+            "nexhealth_location_id": 10,
+            "user_message_content": "book a cleaning",
+            "appt_details": {"Reason": "Cleaning"},
+        }
+    )
+
+    assert command.goto == "send_appointment_type_options"
+    assert [option["id"] for option in command.update["nexhealth_appointment_type_options"]] == [30]
+
+
+def test_normal_booking_auto_selects_single_appointment_type(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {"data": [{"id": 30, "title": "Cleaning"}]},
+            {"nexhealth_bearer_token": "token"},
+        ),
+    )
+
+    command = nodes.get_appointment_type(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_location_id": 10,
+        }
+    )
+
+    assert command.goto == "get_appointment_slots"
+    assert command.update["nexhealth_appointment_type_id"] == 30
+    assert command.update["nexhealth_bearer_token"] == "token"
+
+
+def test_normal_booking_matches_appointment_type_from_details(monkeypatch):
+    monkeypatch.setattr(
+        nodes,
+        "_nexhealth_request",
+        lambda *args, **kwargs: (
+            {
+                "data": [
+                    {"id": 30, "title": "Dental Cleaning"},
+                    {"id": 31, "title": "Root Canal"},
+                ]
+            },
+            {},
+        ),
+    )
+
+    command = nodes.get_appointment_type(
+        {
+            "chat_id": "888",
+            "force_booking_choices": False,
+            "nexhealth_location_id": 10,
+            "user_message_content": "book a dental cleaning",
+            "appt_details": {"Reason": "Dental Cleaning", "Specialty": "Dentistry"},
+        }
+    )
+
+    assert command.goto == "get_appointment_slots"
+    assert command.update["nexhealth_appointment_type_id"] == 30
 
 
 def test_send_location_options_shows_practice_location_names_only(monkeypatch):

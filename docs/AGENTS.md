@@ -120,7 +120,7 @@ Defined in `nodes.py` and wired in `agent.py`:
 - `get_institution`: Fetches NexHealth institutions. Auto-selects when only one exists; otherwise routes to `send_institution_options`. Retried up to 3 times on API failure.
 - `send_institution_options`: Sends institution choices over Telegram with reply buttons, then pauses at `select_institution`.
 - `select_institution`: Parses user institution selection, retries invalid choices, or cancels.
-- `get_location`: Uses `NEXHEALTH_LOCATION_ID` env var when set (skips user prompt). Otherwise fetches active NexHealth locations, auto-selects the single location, or routes to `send_location_options` when multiple exist. Retried up to 3 times on API failure.
+- `get_location`: For detail-bearing requests, uses `NEXHEALTH_LOCATION_ID` when set, auto-selects a single active location, or asks among multiple locations. Generic bookings ignore those shortcuts and always show location choices. Retried up to 3 times on API failure.
 - `send_location_options`: Sends practice location choices over Telegram with reply buttons, then pauses at `select_location`.
 - `select_location`: Parses user location selection, retries invalid choices, or cancels.
 - `get_provider`: Fetches requestable providers and auto-matches or asks user to choose. Retried up to 3 times on API failure.
@@ -148,7 +148,7 @@ Defined in `nodes.py` and wired in `agent.py`:
 - Intent classification is stored once in `user_message_classification` and used downstream instead of recalculating.
 - User confirmation gates all writes that modify user profile data or book appointments.
 - Appointment booking now uses NexHealth API calls directly instead of Firecrawl search, Browserbase cookies, or Stagehand browser automation.
-- Institution and location selection are part of the booking flow. Single-option and env-override (`NEXHEALTH_LOCATION_ID`) cases skip user prompts entirely; multi-option cases send Telegram reply buttons.
+- Generic bookings clear prior scheduling selections and always prompt for institution, location, provider, appointment type, and slot, including single-option cases and configured `NEXHEALTH_LOCATION_ID`. Detail-bearing bookings retain matching, single-option, and env-override shortcuts.
 - Appointment viewing (`appointment_view`) is implemented: routes to `view_appointments`, which fetches upcoming appointments from NexHealth GET /appointments and formats them for Telegram. Requires `NEXHEALTH_LOCATION_ID` to be configured.
 - Rescheduling and cancellation (`appointment_reschedule`, `appointment_cancel`) are recognized by `coerce_turn` and gracefully declined with a "not available yet" message via `send_direct_response`.
 - Location is optional for booking when `NEXHEALTH_LOCATION_ID` is configured, but first-time users are still asked for location to improve future results.

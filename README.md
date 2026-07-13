@@ -48,7 +48,7 @@ draft_appointment_details
   -> book_appointment
 ```
 
-The graph skips selection prompts when it can safely auto-select one option, such as a single NexHealth result or `NEXHEALTH_LOCATION_ID`. When multiple options exist, it sends Telegram reply buttons and still accepts numeric replies.
+For detail-bearing requests, the graph skips selection prompts when it can safely auto-select one option, such as a single NexHealth result or `NEXHEALTH_LOCATION_ID`. Generic requests always prompt for institution, location, provider, appointment type, and slot so a prior booking cannot determine the next one. Choice prompts use Telegram reply buttons and still accept numeric replies.
 
 ## Tech Stack
 
@@ -137,7 +137,7 @@ LANGSMITH_API_KEY=
 ONEHEALTH_LANGSMITH_DATASET="OneHealth Trajectory Dataset"
 ```
 
-`NEXHEALTH_LOCATION_ID` is optional for booking. When set, OneHealth skips the NexHealth location picker. Appointment viewing currently requires it.
+`NEXHEALTH_LOCATION_ID` is optional for booking. When set, OneHealth skips the NexHealth location picker for detail-bearing requests; generic booking requests still ask the user to choose a location. Appointment viewing currently requires it.
 
 ## Run Locally
 

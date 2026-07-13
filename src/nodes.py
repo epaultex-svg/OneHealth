@@ -995,6 +995,7 @@ def plan_next_turn(
         "user_message_classification": classification,
         "conversation_turn": turn,
         "conversation_route": turn.get("action"),
+        "force_booking_choices": turn.get("action") == "start_booking",
         "update_id": msg.get("update_id"),
         "classify_current_message": False,
     }
@@ -1636,12 +1637,34 @@ def store_in_supabase(state: OneHealthAgentState) -> Command[Literal["__end__"]]
 def start_nexhealth_scheduling(state: OneHealthAgentState) -> Command[Literal["get_institution"]]:
     """Start confirmed NexHealth scheduling workflow."""
     msg = _reply(state["chat_id"], booking_intro_text(), remove_keyboard=True)
-    return Command(update={"messages": [msg]}, goto="get_institution")
+    update: dict[str, Any] = {"messages": [msg]}
+    if state.get("force_booking_choices"):
+        update.update({
+            "appt_details": {},
+            "nexhealth_institution_id": None,
+            "nexhealth_institution_subdomain": None,
+            "nexhealth_institution_options": [],
+            "nexhealth_institution_warning": "",
+            "nexhealth_location_id": None,
+            "nexhealth_location_options": [],
+            "nexhealth_provider_id": None,
+            "nexhealth_provider_options": [],
+            "nexhealth_appointment_type_id": None,
+            "nexhealth_appointment_type_options": [],
+            "nexhealth_available_slots": [],
+            "nexhealth_selected_slot": None,
+            "book_appointment_result": None,
+            "nexhealth_appointment_result": None,
+            "appointment_booking_key": None,
+            "appointment_booking_status": None,
+        })
+    return Command(update=update, goto="get_institution")
 
 
 def get_institution(state: OneHealthAgentState) -> Command[Literal["send_institution_options", "get_location", "__end__"]]:
     """Retrieve and store selected NexHealth institution subdomain."""
-    if state.get("nexhealth_institution_subdomain"):
+    force_choices = bool(state.get("force_booking_choices"))
+    if state.get("nexhealth_institution_subdomain") and not force_choices:
         return Command(goto="get_location")
 
     payload, token_update = _nexhealth_request(
@@ -1669,7 +1692,11 @@ def get_institution(state: OneHealthAgentState) -> Command[Literal["send_institu
 
     appt_details = state.get("appt_details") or {}
     practice = _clean(appt_details.get("Practice"))
-    selected = _match_record(institutions, practice) if not _is_missing(practice) else None
+    selected = (
+        _match_record(institutions, practice)
+        if not force_choices and not _is_missing(practice)
+        else None
+    )
     if selected is not None:
         subdomain = _institution_subdomain(selected)
         update: dict[str, Any] = {
@@ -1734,7 +1761,7 @@ def select_institution(state: OneHealthAgentState) -> Command[Literal["get_locat
         retry_prompt="Please reply with one of the listed institution numbers.",
     )
     if selected is None:
-        return Command(update={"conversation_status": "cancelled"}, goto=END)
+        return Command(update={"conversation_status": "cancelled", "force_booking_choices": False}, goto=END)
 
     subdomain = _clean(selected.get("subdomain"))
     if not subdomain:
@@ -1757,7 +1784,8 @@ def select_institution(state: OneHealthAgentState) -> Command[Literal["get_locat
 def get_location(state: OneHealthAgentState) -> Command[Literal["send_location_options", "get_provider", "__end__"]]:
     """Retrieve and store selected NexHealth location ID."""
     env_location_id = os.getenv("NEXHEALTH_LOCATION_ID")
-    if env_location_id:
+    force_choices = bool(state.get("force_booking_choices"))
+    if env_location_id and not force_choices:
         return Command(update={"nexhealth_location_id": int(env_location_id)}, goto="get_provider")
 
     payload, token_update = _nexhealth_request(
@@ -1780,12 +1808,12 @@ def get_location(state: OneHealthAgentState) -> Command[Literal["send_location_o
         return Command(update={**token_update, "message_validation_errors": errors, "messages": [msg]}, goto=END)
 
     selected = None
-    if len(locations) == 1:
+    if len(locations) == 1 and not force_choices:
         selected = locations[0]
     else:
         appt_details = state.get("appt_details") or {}
         practice = _clean(appt_details.get("Practice"))
-        if not _is_missing(practice):
+        if not force_choices and not _is_missing(practice):
             desired = " ".join([
                 practice,
                 _clean(appt_details.get("Location")),
@@ -1832,7 +1860,7 @@ def select_location(state: OneHealthAgentState) -> Command[Literal["get_provider
         retry_prompt="Please reply with one of the listed practice location numbers.",
     )
     if selected is None:
-        return Command(update={"conversation_status": "cancelled"}, goto=END)
+        return Command(update={"conversation_status": "cancelled", "force_booking_choices": False}, goto=END)
 
     location_id = selected.get("id")
     if location_id is None:
@@ -1871,19 +1899,21 @@ def get_provider(state: OneHealthAgentState) -> Command[Literal["send_provider_o
         msg = _reply(state["chat_id"], text)
         return Command(update={**token_update, "message_validation_errors": errors, "messages": [msg]}, goto=END)
 
+    force_choices = bool(state.get("force_booking_choices"))
     selected = None
-    if len(providers) == 1:
+    if len(providers) == 1 and not force_choices:
         selected = providers[0]
     else:
         appt_details = state.get("appt_details") or {}
-        desired = " ".join([
-            state.get("user_message_content", ""),
-            _clean(appt_details.get("Provider")),
-            _clean(appt_details.get("Practice")),
-            _clean(appt_details.get("Specialty")),
-            _clean(appt_details.get("Reason")),
-        ])
-        selected = _match_record(providers, desired)
+        if not force_choices:
+            desired = " ".join([
+                state.get("user_message_content", ""),
+                _clean(appt_details.get("Provider")),
+                _clean(appt_details.get("Practice")),
+                _clean(appt_details.get("Specialty")),
+                _clean(appt_details.get("Reason")),
+            ])
+            selected = _match_record(providers, desired)
 
     if selected is None:
         options = _choice_options(providers, _provider_label)
@@ -1925,7 +1955,7 @@ def select_provider(state: OneHealthAgentState) -> Command[Literal["get_patient"
         retry_prompt="Please reply with one of the listed provider numbers.",
     )
     if selected is None:
-        return Command(update={"conversation_status": "cancelled"}, goto=END)
+        return Command(update={"conversation_status": "cancelled", "force_booking_choices": False}, goto=END)
 
     provider_id = selected.get("id")
     if provider_id is None:
@@ -1962,7 +1992,7 @@ def get_patient(state: OneHealthAgentState) -> Command[Literal["get_appointment_
     )
     patient_info = _collect_patient_info({**state, "patient_info": patient_info})
     if patient_info is None:
-        return Command(update={"conversation_status": "cancelled"}, goto=END)
+        return Command(update={"conversation_status": "cancelled", "force_booking_choices": False}, goto=END)
     cached_patient_id = (
         _coerce_int(state.get("nexhealth_patient_id"))
         or _coerce_int(user_row.get("nexhealth_patient_id"))
@@ -2069,17 +2099,19 @@ def get_appointment_type(state: OneHealthAgentState) -> Command[Literal["send_ap
         msg = _reply(state["chat_id"], text)
         return Command(update={**token_update, "message_validation_errors": errors, "messages": [msg]}, goto=END)
 
+    force_choices = bool(state.get("force_booking_choices"))
     selected = None
-    if len(appointment_types) == 1:
+    if len(appointment_types) == 1 and not force_choices:
         selected = appointment_types[0]
     else:
         appt_details = state.get("appt_details") or {}
-        desired = " ".join([
-            _clean(appt_details.get("Reason")),
-            _clean(appt_details.get("Specialty")),
-            state.get("user_message_content", ""),
-        ])
-        selected = _match_record(appointment_types, desired)
+        if not force_choices:
+            desired = " ".join([
+                _clean(appt_details.get("Reason")),
+                _clean(appt_details.get("Specialty")),
+                state.get("user_message_content", ""),
+            ])
+            selected = _match_record(appointment_types, desired)
 
     if selected is None:
         options = _choice_options(appointment_types, _appointment_type_label)
@@ -2121,7 +2153,7 @@ def select_appointment_type(state: OneHealthAgentState) -> Command[Literal["get_
         retry_prompt="Please reply with one of the listed appointment type numbers.",
     )
     if selected is None:
-        return Command(update={"conversation_status": "cancelled"}, goto=END)
+        return Command(update={"conversation_status": "cancelled", "force_booking_choices": False}, goto=END)
 
     appointment_type_id = selected.get("id")
     if appointment_type_id is None:
@@ -2227,7 +2259,14 @@ def select_appointment_slot(state: OneHealthAgentState) -> Command[Literal["book
         text = _resume_text(resume, state)
         if is_cancel_text(text):
             cancel_msg = _reply(state["chat_id"], cancelled_text(), remove_keyboard=True)
-            return Command(update={"conversation_status": "cancelled", "messages": [cancel_msg]}, goto=END)
+            return Command(
+                update={
+                    "conversation_status": "cancelled",
+                    "force_booking_choices": False,
+                    "messages": [cancel_msg],
+                },
+                goto=END,
+            )
         match = re.search(r"\d+", text)
         if match:
             index = int(match.group())
@@ -2304,6 +2343,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
             update={
                 "appointment_booking_key": booking_key,
                 "appointment_booking_status": status,
+                "force_booking_choices": False,
                 "message_validation_errors": errors,
                 "messages": [msg],
             },
@@ -2354,6 +2394,7 @@ def book_appointment(state: OneHealthAgentState) -> Command[Literal["__end__"]]:
             "nexhealth_appointment_result": payload,
             "appointment_booking_key": booking_key,
             "appointment_booking_status": "booked",
+            "force_booking_choices": False,
             "message_validation_errors": errors,
             "messages": [msg],
         },

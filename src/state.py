@@ -87,6 +87,7 @@ class OneHealthAgentState(TypedDict, total=False):
     user_message_classification: TextClassification | None
     conversation_turn: ConversationTurn | None
     conversation_route: str | None
+    force_booking_choices: bool
     message_validation_errors: list[str]
     direct_response: str
     retrieved_profile: RetrievedProfile | None
