@@ -136,13 +136,25 @@ def _consume_debug_stream(
     finished = False
     appended: list[str] = []
 
-    for event in graph.stream(value, config=config, stream_mode="debug"):
+    # subgraphs=True is required so the booking subgraph's interior nodes
+    # stream individually instead of collapsing into one "booking" task.
+    # namespace is () for the top-level graph and ("booking:<task-id>",)
+    # inside the booking subgraph.
+    for namespace, event in graph.stream(
+        value, config=config, stream_mode="debug", subgraphs=True
+    ):
         event_type = event.get("type")
         payload = event.get("payload") or {}
+        is_top_level = namespace == ()
 
         if event_type == "task":
             task_id = str(payload.get("id"))
             name = payload.get("name")
+            # The parent's own "booking" task is a wrapper around the whole
+            # subgraph; expected_trajectory never lists "booking" itself,
+            # only interior node names, so skip the wrapper.
+            if is_top_level and name == "booking":
+                continue
             if name and name != "__start__" and task_id not in seen_task_ids:
                 seen_task_ids.add(task_id)
                 trajectory.append(name)
@@ -151,12 +163,22 @@ def _consume_debug_stream(
         elif event_type == "task_result":
             name = payload.get("name")
             if payload.get("interrupts"):
-                interrupted_at = str(name) if name else None
+                # An interior interrupt bubbles up and the wrapping "booking"
+                # task_result also reports interrupts for the same pause.
+                # Prefer the interior name so resume-node backfill below
+                # (and interrupted_nodes) never sees "booking".
+                if not (is_top_level and name == "booking" and interrupted_at):
+                    interrupted_at = str(name) if name else None
             if payload.get("error"):
                 errors.append(f"{name}: {payload['error']}")
 
         elif event_type == "checkpoint":
-            if payload.get("next") == []:
+            # Only the top-level graph's own checkpoint can signal the run
+            # is finished. The booking subgraph emits its OWN interior
+            # checkpoints (namespace ("booking:<id>",)) whenever ITS queue
+            # empties -- including right after an interior interrupt -- and
+            # those also show next == [], which is not "the whole run is done".
+            if is_top_level and payload.get("next") == []:
                 finished = True
 
     return interrupted_at, finished, appended
@@ -271,6 +293,36 @@ def _local_smoke(path: Path, limit: int) -> None:
             "user_experience_assertions": user_experience_assertions_evaluator(run, example),
         }
         print(json.dumps({"id": example.get("id"), "outputs": outputs, "scores": result}, indent=2))
+
+
+def _load_csv_rows(path: Path) -> list[dict[str, Any]]:
+    import csv
+
+    rows: list[dict[str, Any]] = []
+    with path.open(newline="", encoding="utf-8") as fh:
+        for row in csv.DictReader(fh):
+            case = _as_dict(row.get("agent_test_case"))
+            expected = _as_dict(row.get("expected_result"))
+            rows.append({"id": case.get("example_id"), "case": case, "expected": expected})
+    return rows
+
+
+def _local_csv_smoke(path: Path, limit: int) -> None:
+    """Run OneHealth_test_dataset.csv rows directly and locally, offline from
+    LangSmith. dataset.json (the fixture --local-json expects) isn't checked
+    into this repo, so this reads the same CSV LangSmith consumes instead."""
+    rows = _load_csv_rows(path)[:limit]
+    for row in rows:
+        inputs = {"example_id": row["id"], "agent_test_case": row["case"]}
+        outputs = run_onehealth_agent(inputs)
+        run = {"outputs": outputs}
+        example = {"outputs": {"expected_result": row["expected"]}}
+        result = {
+            "trajectory_match": trajectory_match_evaluator(run, example),
+            "expected_state_match": expected_state_match_evaluator(run, example),
+            "user_experience_assertions": user_experience_assertions_evaluator(run, example),
+        }
+        print(json.dumps({"id": row["id"], "outputs": outputs, "scores": result}, indent=2))
 
 
 def main() -> None:
