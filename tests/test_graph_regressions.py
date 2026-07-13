@@ -1408,6 +1408,92 @@ def test_interpret_user_confirmation_cancel_stops_before_side_effects(monkeypatc
     assert sent[-1]["remove_keyboard"] is True
 
 
+def test_interpret_user_confirmation_survives_none_structured_output(monkeypatch):
+    """Regression: gpt-oss can return None from structured output. The node
+    must not crash on None['decision'] and must route to a visible node
+    (correction), never silently doing nothing and never booking."""
+
+    class NoneModel:
+        def with_structured_output(self, schema):
+            return FakeStructured(None)
+
+        def invoke(self, messages):
+            return type("Response", (), {"content": ""})()
+
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: None))
+    monkeypatch.setattr(
+        nodes, "interrupt", lambda payload: {"text": "hmm not sure", "update_id": 22}
+    )
+    monkeypatch.setattr(nodes, "_model", lambda *a, **k: NoneModel())
+
+    command = nodes.interpret_user_confirmation(
+        {
+            "chat_id": "888",
+            "user_message_classification": {"intent": "appointment"},
+        }
+    )
+
+    # Pre-fix: TypeError: 'NoneType' object is not subscriptable.
+    assert command.goto == "send_correction_query"
+
+
+def test_interpret_user_confirmation_yes_button_confirms_without_model(monkeypatch):
+    """Regression: the 'Yes' keyboard button must confirm deterministically
+    without ever calling the flaky LLM classifier."""
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: None))
+    monkeypatch.setattr(
+        nodes, "interrupt", lambda payload: {"text": "Yes", "update_id": 23}
+    )
+    monkeypatch.setattr(
+        nodes, "_model", lambda *a, **k: pytest.fail("Yes button must not hit the LLM")
+    )
+
+    command = nodes.interpret_user_confirmation(
+        {
+            "chat_id": "888",
+            "user_message_classification": {"intent": "appointment"},
+        }
+    )
+
+    assert command.goto == "booking"
+    assert command.update["user_message_content"] == "Yes"
+
+
+def test_correct_info_survives_none_structured_output(monkeypatch):
+    """Regression: correct_info is the downstream of the denied route and has
+    the same gpt-oss None risk. A None extraction must not crash; it routes
+    back to send_user_confirmation."""
+
+    class ReviseNoneModel:
+        def with_structured_output(self, schema):
+            return FakeStructured(None)
+
+        def invoke(self, messages):
+            return type(
+                "Response", (), {"content": "Okay, updated. Does this look right?"}
+            )()
+
+    monkeypatch.setattr(nodes, "send_message", FakeTool(lambda payload: None))
+    monkeypatch.setattr(
+        nodes,
+        "interrupt",
+        lambda payload: {"text": "change the date to Friday", "update_id": 24},
+    )
+    monkeypatch.setattr(nodes, "_model", lambda *a, **k: ReviseNoneModel())
+
+    command = nodes.correct_info(
+        {
+            "chat_id": "888",
+            "user_message_classification": {"intent": "appointment"},
+            "appt_draft": "Date: Monday",
+            "appt_details": {"Date": "Monday"},
+        }
+    )
+
+    assert command.goto == "send_user_confirmation"
+    assert command.update["appt_details"] == {}
+
+
 def test_select_provider_invalid_choice_reprompts_then_cancel(monkeypatch):
     sent = []
     replies = iter([

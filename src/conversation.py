@@ -125,6 +125,55 @@ def is_cancel_text(text: object) -> bool:
     return normalized in CANCEL_WORDS
 
 
+CONFIRM_WORDS = {
+    "yes",
+    "y",
+    "yeah",
+    "yep",
+    "yup",
+    "ok",
+    "okay",
+    "sure",
+    "correct",
+    "confirm",
+    "confirmed",
+    "right",
+    "looks good",
+    "thats right",
+    "that's right",
+    "sounds good",
+    "good",
+}
+DENY_WORDS = {
+    "change",
+    "no",
+    "n",
+    "nope",
+    "nah",
+    "wrong",
+    "fix",
+    "edit",
+    "incorrect",
+    "not right",
+}
+
+
+def classify_confirmation(text: object) -> str | None:
+    """Deterministically classify a reply to a confirmation prompt.
+
+    Returns "confirmed" or "denied" for recognized replies (including the
+    "Yes" / "Change" keyboard buttons), or None when the reply is freeform and
+    the caller should fall back to the LLM classifier. Cancel replies are
+    handled separately by is_cancel_text before this is reached.
+    """
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if normalized in CONFIRM_WORDS:
+        return "confirmed"
+    if normalized in DENY_WORDS:
+        return "denied"
+    return None
+
+
 def location_request_text() -> str:
     return (
         "Share your location to help find nearby appointment options. "

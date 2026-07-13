@@ -44,6 +44,7 @@ from conversation import (
     cancelled_text,
     choice_keyboard,
     choice_text,
+    classify_confirmation,
     confirmation_keyboard,
     correction_prompt_text,
     invalid_choice_text,
@@ -1456,19 +1457,32 @@ def interpret_user_confirmation(
             goto=END,
         )
 
-    system = (
-        "Classify the user's reply to a confirmation prompt into exactly one decision:\n"
-        "- 'confirmed': user approves the draft (yes, ok, looks good, correct, sure, etc.).\n"
-        "- 'denied': user rejects or wants changes (no, wrong, change, fix, edit, etc.).\n"
-        "Return only the decision label."
-    )
-    classifier = _model().with_structured_output(ConfirmationDecision)
-    decision: ConfirmationDecision = classifier.invoke([
-        SystemMessage(content=system),
-        HumanMessage(content=reply_text),
-    ])
+    # Deterministic first: the "Yes"/"Change" keyboard buttons (and common
+    # freeform yes/no words) resolve without an LLM call, so button taps never
+    # depend on the flaky structured-output path below.
+    decision_label = classify_confirmation(reply_text)
+    if decision_label is None:
+        system = (
+            "Classify the user's reply to a confirmation prompt into exactly one decision:\n"
+            "- 'confirmed': user approves the draft (yes, ok, looks good, correct, sure, etc.).\n"
+            "- 'denied': user rejects or wants changes (no, wrong, change, fix, edit, etc.).\n"
+            "Return only the decision label."
+        )
+        classifier = _model().with_structured_output(ConfirmationDecision)
+        decision = classifier.invoke([
+            SystemMessage(content=system),
+            HumanMessage(content=reply_text),
+        ])
+        # gpt-oss intermittently returns None/malformed from structured output
+        # (same failure the drafters guard at draft_appointment_details and
+        # draft_user_info_storage_details). Never crash, never silently book:
+        # an unusable result means "not confirmed".
+        if isinstance(decision, dict) and decision.get("decision") in ("confirmed", "denied"):
+            decision_label = decision["decision"]
+        else:
+            decision_label = "denied"
 
-    if decision["decision"] == "denied":
+    if decision_label == "denied":
         next_node = "send_correction_query"
     elif intent == "appointment":
         next_node = "booking"
@@ -1570,6 +1584,10 @@ def correct_info(
             SystemMessage(content=extract_system),
             HumanMessage(content=correction_text),
         ])
+        # Same None-guard as the drafters: a failed structured-output call must
+        # not crash the correction; treat it as "nothing merged".
+        if details is None:
+            details = {}
         update["appt_details"] = details
         update["appt_draft"] = appointment_confirmation_text(details)
     else:
@@ -1591,6 +1609,10 @@ def correct_info(
             SystemMessage(content=extract_system),
             HumanMessage(content=correction_text),
         ])
+        # Same None-guard as the drafters: a failed structured-output call must
+        # not crash the correction; treat it as "nothing merged".
+        if extracted is None:
+            extracted = {}
         update["user_info_extracted"] = extracted
 
     return Command(update=update, goto="send_user_confirmation")
