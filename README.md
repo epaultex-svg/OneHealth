@@ -4,6 +4,17 @@ OneHealth is a LangGraph-based healthcare scheduling agent that runs over Telegr
 
 The project is built as a real multi-turn agent, not a single prompt wrapper. It uses deterministic routing for simple protocol cases, LLM planning for ambiguous messages, guarded response generation, Telegram interrupt/resume, NexHealth API calls, Postgres-backed webhook work tracking, and LangSmith evaluations.
 
+## Getting Started (Telegram)
+
+Fastest way to try OneHealth: talk to it in Telegram.
+
+1. Open Telegram.
+2. Search for @OneHealth_telegrambot.
+3. Start chat, send message (e.g. "book appointment", "show my appointments", "update my location").
+4. Bot walks you through details, confirms before writing/booking, replies with result.
+
+No setup needed on your end — bot handles routing, confirmation, and NexHealth scheduling.
+
 ## Features
 
 - Telegram message intake through polling or webhook delivery.
